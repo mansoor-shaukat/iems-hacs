@@ -382,8 +382,21 @@ class IemsCoordinator:
                 log.error("heartbeat crashed: %s: %s", type(exc).__name__, exc)
 
     async def start(self) -> None:
-        self._batch_task = asyncio.create_task(self._batch_loop())
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        # v0.1.14: Schedule long-running loops via hass.async_create_task when
+        # available. Plain asyncio.create_task only stores a WEAK reference in
+        # the event loop — the task can be silently garbage-collected mid-flight
+        # (Python asyncio docs §asyncio.create_task). Fall back to
+        # asyncio.create_task in test envs where hass is a MagicMock that doesn't
+        # implement async_create_task with the right signature.
+        # See edge_poc_outage._schedule_amber for the full rationale + the
+        # 2026-05-02 production incident that surfaced this bug class.
+        create_task = getattr(self._hass, "async_create_task", None)
+        if callable(create_task):
+            self._batch_task = create_task(self._batch_loop())
+            self._heartbeat_task = create_task(self._heartbeat_loop())
+        else:
+            self._batch_task = asyncio.create_task(self._batch_loop())
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
     async def stop(self) -> None:
         for t in (self._batch_task, self._heartbeat_task):

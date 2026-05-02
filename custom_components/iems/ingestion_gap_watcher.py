@@ -104,7 +104,15 @@ class IngestionGapWatcher:
         batch_cadence_s: float = BATCH_CADENCE_S,
         gap_threshold_pct: float = GAP_THRESHOLD_PCT,
         check_interval_s: float = CHECK_INTERVAL_S,
+        hass: Any = None,
     ) -> None:
+        # `hass` is optional so existing tests continue to work, but production
+        # __init__.py wiring SHOULD pass hass=hass so start() can schedule the
+        # background check loop via hass.async_create_task. Without it we fall
+        # back to asyncio.create_task — which the loop only weak-refs (Python
+        # asyncio docs §asyncio.create_task) and which is the same bug class
+        # that surfaced in edge_poc_outage v0.1.13.
+        self._hass = hass
         self._publish_fn = publish_fn
         self._user_id = user_id
         self._entity_ids: frozenset[str] = frozenset(entity_ids)
@@ -149,13 +157,21 @@ class IngestionGapWatcher:
         return len(self._sample_times[entity_id])
 
     async def start(self) -> None:
-        """Start the background check loop."""
+        """Start the background check loop.
+
+        v0.1.14: Schedule via hass.async_create_task when hass is available,
+        falling back to asyncio.create_task for tests. Plain loop.create_task
+        only stores a weak reference — the long-running check loop can be
+        silently garbage-collected (Python asyncio docs §asyncio.create_task,
+        HA developer docs §Working with Async). Same bug class fixed in
+        edge_poc_outage._schedule_amber.
+        """
         self._running = True
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.get_event_loop()
-        self._check_task = loop.create_task(self._check_loop())
+        create_task = getattr(self._hass, "async_create_task", None) if self._hass else None
+        if callable(create_task):
+            self._check_task = create_task(self._check_loop())
+        else:
+            self._check_task = asyncio.create_task(self._check_loop())
         log.info(
             "iems: gap_watcher started: %d entities, window=%.0fs, threshold=%.0f%%",
             len(self._entity_ids), self._gap_window_s, self._gap_threshold_pct,

@@ -442,20 +442,34 @@ class EdgePocOutageHandler:
     # ------------------------------------------------------------------ #
 
     def _schedule_amber(self) -> None:
+        # v0.1.14: Schedule via hass.async_create_task, NEVER loop.create_task.
+        #
+        # Python's asyncio docs warn that the event loop only keeps WEAK
+        # references to tasks created via asyncio.create_task / loop.create_task.
+        # A task that isn't strongly referenced "may get garbage collected at
+        # any time, even before it's done."
+        # https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
+        #
+        # Home Assistant's official guidance (Working with Async, developers.
+        # home-assistant.io) is to use `hass.async_create_task` from integration
+        # code: it registers the task on `hass._tasks` (strong ref), ties the
+        # task lifecycle to integration setup/teardown, and uses eager_start so
+        # the coroutine begins executing immediately rather than next loop tick.
+        #
+        # Why we cared: v0.1.13 used loop.create_task here. CTO end-to-end test
+        # 2026-05-02 — service call → on_grid_off → _schedule_amber → 65 s
+        # later the lamp had not changed. Direct REST `light.turn_on` with
+        # the same xy/brightness fired the lamp instantly, proving the lamp
+        # path was healthy and the task was being silently dropped en route.
         self._cancel_amber()
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.get_event_loop()
-        self._amber_task = loop.create_task(self._debounced_amber())
+        self._amber_task = self._hass.async_create_task(self._debounced_amber())
 
     def _schedule_restore(self) -> None:
+        # See _schedule_amber for full rationale. Same fix, same reason.
         self._cancel_restore()
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.get_event_loop()
-        self._restore_task = loop.create_task(self._debounced_restore())
+        self._restore_task = self._hass.async_create_task(
+            self._debounced_restore()
+        )
 
     def _cancel_amber(self) -> None:
         if self._amber_task and not self._amber_task.done():
