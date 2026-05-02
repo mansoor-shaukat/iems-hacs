@@ -1,24 +1,29 @@
-"""Edge PoC — outage-signal → light.living_lamp blue (outage signal).
+"""Edge PoC — continuous grid-health lamp indicator.
 
 Sprint 5 Track B. Single-site PoC (Mansoor's home). Zero cloud round-trip.
+
+CEO directive 2026-05-02 (v0.1.15):
+  Lamp is a continuous grid-state indicator, NOT a fire-once outage signal.
+  Grid up   → cool white  (color_temp_kelvin = 5500, brightness 200).
+  Grid down → blue        (xy_color [0.1532, 0.0475], brightness 200).
+
+State is derived each evaluation. There is no captured/restored prior state —
+v0.1.14 had a capture/restore choreography that made the integration impossible
+to verify without a real outage (the safety guard cancelled any pending apply
+whenever it saw grid-up). v0.1.15 makes the lamp's job trivial to verify: just
+look at it.
 
 Trigger: ALL four grid-voltage sensors simultaneously NULL or < 50V (AND rule).
 This mirrors the production-tested canonical detector in
 solarman_bridge/manager.py:_check_grid_status.
 DO NOT use binary_sensor.inverter[12]_grid — those flap on Solarman polling
-glitches (3 confirmed false positives across 14 days, substs held 210-216V).
+glitches (3 confirmed false positives across 14 days, substations held 210-216V).
 See: docs/architecture/canonical_signals.md §Grid availability.
 
-When grid loss is confirmed (4-of-4 NULL/<50V, ≥60s sustained):
-  1. Capture current lamp state to HA Storage (survives HA restart).
-  2. Apply blue (xy_color [0.1532, 0.0475], brightness 200) within ≤2s.
-  3. When ALL 4 voltages ≥ 50V for ≥60s, restore prior lamp state.
-  4. Log fire/restore events + latency to local SQLite.
-
-Color directive (CEO 2026-05-01): outage lamp is BLUE — not amber, not crimson.
-xy_color [0.1532, 0.0475] is the Philips Hue published Gamut C blue corner
-(highest-saturation deep blue physically realisable on Hue color lamps).
-Bilal verifies against the lamp's reported gamut on first deploy.
+Lifecycle:
+  startup           → evaluate grid → paint matching colour IMMEDIATELY (no debounce)
+  voltage transition → evaluate grid → if state flipped, schedule apply with debounce
+  state unchanged   → no apply (idempotent)
 
 Detection helper: _grid_is_down(states)
   Returns True  iff EVERY listed inverter's voltage is missing/None or < 50V.
@@ -29,10 +34,6 @@ Detection helper: _grid_is_down(states)
              CEO directive 2026-05-01 (tightened from < 3).
 
 Phasing: CEO-scoped single-site PoC. NOT a commercial CONTROL ship.
-Sprint 7 CONTROL gate does not apply. No rollout until:
-  (a) 14-day burn-in verdict positive
-  (b) VISUAL_INDICATOR sub-class taxonomised by Ilya v0.2.0
-  (c) User-data implications reviewed (onboarding_privacy_gdpr.md)
 
 See: docs/integrations/edge_poc_outage_color.md for full spec.
 """
@@ -84,15 +85,23 @@ STALE_WINDOW_S: float = 60.0
 OUTAGE_XY: tuple[float, float] = (0.1532, 0.0475)
 OUTAGE_BRIGHTNESS: int = 200
 
+# Grid-up colour — clean cool white via Kelvin (CEO directive 2026-05-02).
+# 5500K reads as a clean cool white on Hue lamps without going harsh; the
+# lamp's `supported_color_modes` include both `color_temp` and `xy`, so
+# Kelvin is the cleaner channel (no chromaticity drift).
+# Brightness matches OUTAGE_BRIGHTNESS so signal strength is comparable
+# across the two states.
+GRID_UP_COLOR_TEMP_KELVIN: int = 5500
+GRID_UP_BRIGHTNESS: int = 200
+
 # Debounce windows (seconds) — 60s/60s per CEO directive 2026-04-29.
 # Analysis: all 3 confirmed false positives lasted 37–38s; real outages start
 # at ≥6 min. 60s sustained-NULL across all 4 inverters = unambiguous outage.
+# v0.1.15: debounce is per-transition, not per-event-type. Initial paint on
+# startup does NOT debounce — the lamp must reflect actual current state on
+# load, not 60s later.
 GRID_OFF_DEBOUNCE_S: float = 60.0
 GRID_ON_DEBOUNCE_S: float = 60.0
-
-# HA Storage key for captured lamp state
-STORAGE_KEY = "iems_poc_lamp_state"
-STORAGE_VERSION = 1
 
 # SQLite log path (under HA config dir; resolved at runtime via hass.config.path)
 SQLITE_FILENAME = "iems_poc_decisions.sqlite"
@@ -107,6 +116,13 @@ CREATE TABLE IF NOT EXISTS poc_decisions (
     success     INTEGER NOT NULL
 );
 """
+
+# Internal state-flag values — used both as the desired-colour token passed
+# into the scheduler and as the bookkeeping for "what colour does the lamp
+# currently believe it's set to". `None` means "unknown / not yet painted".
+_STATE_GRID_UP = "cool_white"
+_STATE_GRID_DOWN = "blue"
+
 
 # --------------------------------------------------------------------------
 # Grid-down detection (canonical AND-of-all rule)
@@ -151,7 +167,6 @@ def _grid_is_down(states: list[Any]) -> bool:
         last_updated = getattr(state_obj, "last_updated", None)
         if last_updated is not None:
             try:
-                # HA returns a datetime; convert to epoch for comparison.
                 if hasattr(last_updated, "timestamp"):
                     lu_epoch = last_updated.timestamp()
                 else:
@@ -210,6 +225,10 @@ def log_event(
 
     Never raises — a logging failure must not interrupt the automation path.
     Uses parameterized placeholders (security rule: no f-strings in SQL).
+
+    `prior_state` is retained as a column for backwards compatibility with
+    the existing schema and pre-v0.1.15 rows, but v0.1.15 always writes NULL
+    here (lamp colour is now derived, not captured).
     """
     try:
         _ensure_schema(db_path)
@@ -227,59 +246,13 @@ def log_event(
 
 
 # --------------------------------------------------------------------------
-# Lamp state capture / apply / restore
+# Lamp apply helpers
 # --------------------------------------------------------------------------
 
 
-async def capture_lamp_state(hass, entity_id: str) -> dict[str, Any]:
-    """Read current lamp state from HA state machine.
-
-    Returns a dict with all color fields (whichever are populated by HA).
-    Persists the dict to HA Storage so it survives HA restarts.
-
-    Returns a minimal dict with state="off" if lamp is off or unavailable.
-    """
-    state_obj = hass.states.get(entity_id)
-    if state_obj is None:
-        log.warning("edge_poc: capture_lamp_state: entity %s not found", entity_id)
-        return {"state": "off", "captured_at": _utc_now_z()}
-
-    attrs = dict(state_obj.attributes) if state_obj.attributes else {}
-    captured: dict[str, Any] = {
-        "state": state_obj.state,
-        "brightness": attrs.get("brightness"),
-        "color_mode": attrs.get("color_mode"),
-        "xy_color": attrs.get("xy_color"),
-        "hs_color": attrs.get("hs_color"),
-        "rgb_color": attrs.get("rgb_color"),
-        "color_temp": attrs.get("color_temp"),
-        "captured_at": _utc_now_z(),
-    }
-
-    # Persist to HA Storage (survives restarts)
-    try:
-        from homeassistant.helpers.storage import Store  # type: ignore[import]
-        store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
-        await store.async_save(captured)
-        log.debug("edge_poc: lamp state captured and persisted: state=%s", captured["state"])
-    except (ImportError, Exception) as exc:  # noqa: BLE001 — storage failure is non-fatal
-        log.warning("edge_poc: failed to persist lamp state to storage: %s: %s", type(exc).__name__, exc)
-
-    return captured
-
-
-async def apply_outage_color(hass, entity_id: str, prior_state: dict[str, Any]) -> None:
-    """Turn lamp to the outage color (blue: xy_color [0.1532, 0.0475], brightness 200).
-
-    CEO directive 2026-05-01: outage signal is BLUE (was amber Day 1-4).
-
-    prior_state is expected to already be persisted by capture_lamp_state.
-    This call does NOT re-persist — it only issues the service call.
-    """
-    log.info(
-        "edge_poc: applying outage color (blue) to %s (prior state=%s brightness=%s)",
-        entity_id, prior_state.get("state"), prior_state.get("brightness"),
-    )
+async def apply_outage_color(hass, entity_id: str) -> None:
+    """Turn lamp BLUE — the grid-down indicator (xy_color [0.1532,0.0475], brightness 200)."""
+    log.info("edge_poc: applying outage colour (blue) to %s", entity_id)
     await hass.services.async_call(
         "light",
         "turn_on",
@@ -293,73 +266,27 @@ async def apply_outage_color(hass, entity_id: str, prior_state: dict[str, Any]) 
     )
 
 
-async def restore_state(hass, entity_id: str, prior_state: dict[str, Any]) -> None:
-    """Restore lamp to its captured prior state.
+async def apply_grid_up_color(hass, entity_id: str) -> None:
+    """Turn lamp COOL WHITE — the grid-up indicator (color_temp_kelvin 5500, brightness 200).
 
-    If prior state was "off", turns the lamp off.
-    If prior state was "on", restores color + brightness using whichever
-    color mode was captured (xy preferred, then hs, then rgb, then color_temp).
+    Uses Kelvin rather than xy_color so the lamp picks the cleanest white path
+    its hardware supports. We deliberately do NOT also send xy/hs in the same
+    payload: some Hue firmwares prioritise the chromaticity field over Kelvin
+    and the lamp would fall slightly off-white.
     """
-    if prior_state.get("state") == "off":
-        log.info("edge_poc: restoring %s to off (prior state was off)", entity_id)
-        await hass.services.async_call(
-            "light",
-            "turn_off",
-            {"entity_id": entity_id},
-            blocking=True,
-        )
-        return
-
-    service_data: dict[str, Any] = {"entity_id": entity_id, "transition": 0}
-    if prior_state.get("brightness") is not None:
-        service_data["brightness"] = prior_state["brightness"]
-
-    # Apply whichever color representation was captured
-    if prior_state.get("xy_color") is not None:
-        service_data["xy_color"] = list(prior_state["xy_color"])
-    elif prior_state.get("hs_color") is not None:
-        service_data["hs_color"] = list(prior_state["hs_color"])
-    elif prior_state.get("rgb_color") is not None:
-        service_data["rgb_color"] = list(prior_state["rgb_color"])
-    elif prior_state.get("color_temp") is not None:
-        service_data["color_temp"] = prior_state["color_temp"]
-
-    log.info(
-        "edge_poc: restoring %s color_mode=%s brightness=%s",
-        entity_id, prior_state.get("color_mode"), prior_state.get("brightness"),
-    )
+    log.info("edge_poc: applying grid-up colour (cool white %dK) to %s",
+             GRID_UP_COLOR_TEMP_KELVIN, entity_id)
     await hass.services.async_call(
         "light",
         "turn_on",
-        service_data,
+        {
+            "entity_id": entity_id,
+            "color_temp_kelvin": GRID_UP_COLOR_TEMP_KELVIN,
+            "brightness": GRID_UP_BRIGHTNESS,
+            "transition": 0,
+        },
         blocking=True,
     )
-
-
-async def _load_persisted_state(hass) -> dict[str, Any] | None:
-    """Load previously persisted lamp state from HA Storage.
-
-    Returns None if storage key absent or JSON-malformed (Scenario C).
-    """
-    try:
-        from homeassistant.helpers.storage import Store  # type: ignore[import]
-        store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
-        data = await store.async_load()
-        if data and isinstance(data, dict):
-            return data
-    except (ImportError, Exception) as exc:  # noqa: BLE001
-        log.warning("edge_poc: failed to load persisted state: %s: %s", type(exc).__name__, exc)
-    return None
-
-
-async def _clear_persisted_state(hass) -> None:
-    """Remove persisted lamp state after successful restore."""
-    try:
-        from homeassistant.helpers.storage import Store  # type: ignore[import]
-        store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
-        await store.async_remove()
-    except (ImportError, Exception) as exc:  # noqa: BLE001
-        log.warning("edge_poc: failed to clear persisted state: %s: %s", type(exc).__name__, exc)
 
 
 # --------------------------------------------------------------------------
@@ -368,209 +295,192 @@ async def _clear_persisted_state(hass) -> None:
 
 
 class EdgePocOutageHandler:
-    """Manages the outage → blue → restore lifecycle for the edge PoC.
+    """Manages the lamp colour ↔ grid-state relationship.
 
     Wired into IemsCoordinator.start() via async_setup_entry.
     Subscribes to voltage state changes on all 4 VOLTAGE_ENTITY_IDS.
     On each state change, calls _grid_is_down() (AND-of-all check).
 
     Lifecycle:
-      all 4 voltages NULL/<50V  →  [60s debounce]  →  capture + outage color (blue)
-      all 4 voltages ≥50V       →  [60s debounce]  →  restore
+      async_start      → paint current grid state IMMEDIATELY (no debounce)
+      voltage transition (grid_down → grid_up)   → schedule cool-white (60s debounce)
+      voltage transition (grid_up   → grid_down) → schedule blue       (60s debounce)
+      voltage event with state unchanged          → no-op (idempotent)
 
-    The external API (on_grid_off / on_grid_recovered) is preserved for
-    service-call-based automation YAML wiring and unit tests.
+    Public service-call entry-points (kept for contract compatibility with
+    existing user automations):
+      on_grid_off()       — re-evaluates actual state; reflects truth, not fiction
+      on_grid_recovered() — same; lamp is a state indicator, not a remote control
     """
 
     def __init__(self, hass, db_path: str) -> None:
         self._hass = hass
         self._db_path = db_path
-        self._amber_task: asyncio.Task | None = None
-        self._restore_task: asyncio.Task | None = None
+        # Single pending task slot — there's only ever one in-flight transition
+        # because the two debounces both push toward the same lamp.
+        self._pending_task: asyncio.Task | None = None
+        # The colour token we last asked the lamp to display, OR the colour
+        # the pending debounce is heading toward. Used to suppress redundant
+        # applies and to detect "state flipped back" cancellation.
+        self._target_state: str | None = None
         self._unsub: list = []
-        self._outage_active: bool = False
-        self._prior_state: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------ #
-    # Public HA event entry-points (called from service handlers +        #
-    # voltage state-change subscription)                                  #
+    # Public entry-points                                                  #
     # ------------------------------------------------------------------ #
 
     def on_grid_off(self) -> None:
-        """Called when AND-of-all voltage check concludes grid is down.
+        """Manual `iems.edge_poc_outage_grid_off` service call.
 
-        Cancels any pending restore and schedules the outage-color action
-        after GRID_OFF_DEBOUNCE_S seconds.
+        v0.1.15: kept for contract compatibility; delegates to the actual-state
+        evaluator. The lamp tells the truth — it does not lie because a user
+        manually fired a service call. CEO directive 2026-05-02.
         """
-        log.info("edge_poc: grid off detected — scheduling outage color (debounce=%.1fs)", GRID_OFF_DEBOUNCE_S)
-        self._cancel_restore()
-        self._schedule_amber()
+        log.info("edge_poc: manual grid_off service call — re-evaluating actual state")
+        self.handle_voltage_state_change()
 
     def on_grid_recovered(self) -> None:
-        """Called when AND-of-all voltage check concludes grid is up.
+        """Manual `iems.edge_poc_outage_grid_recovered` service call.
 
-        Cancels any pending outage-color action (if grid recovered before
-        debounce elapsed) and schedules restore after GRID_ON_DEBOUNCE_S seconds.
+        Same as on_grid_off: re-evaluates real state. Lamp reflects reality.
         """
-        log.info("edge_poc: grid recovered — scheduling restore (debounce=%.1fs)", GRID_ON_DEBOUNCE_S)
-        self._cancel_amber()
-        if self._outage_active:
-            self._schedule_restore()
+        log.info("edge_poc: manual grid_recovered service call — re-evaluating actual state")
+        self.handle_voltage_state_change()
 
     def handle_voltage_state_change(self) -> None:
         """Called on any VOLTAGE_ENTITY_IDS state change event.
 
         Reads current state of all 4 voltage entities, runs _grid_is_down(),
-        and delegates to on_grid_off() or on_grid_recovered() as appropriate.
-        Only transitions are acted on (avoids re-scheduling on repeated same state).
+        and either:
+          - schedules a debounced colour apply (if state flipped), or
+          - cancels a pending debounce (if state flipped back to current), or
+          - no-ops (if state matches what we already painted).
+        """
+        target = self._evaluate_target_state()
+
+        if target == self._target_state:
+            # Already painted (or pending) the right colour — nothing to do.
+            return
+
+        self._schedule_apply(target)
+
+    # ------------------------------------------------------------------ #
+    # Internal — state evaluation + scheduling                             #
+    # ------------------------------------------------------------------ #
+
+    def _evaluate_target_state(self) -> str:
+        """Read current voltages and decide the target lamp colour.
+
+        Returns _STATE_GRID_UP or _STATE_GRID_DOWN. The fail-safe-to-up
+        semantics inside _grid_is_down() mean inconclusive readings produce
+        _STATE_GRID_UP — we never paint blue on an unconfirmed outage.
         """
         voltage_states = [
             self._hass.states.get(eid) for eid in VOLTAGE_ENTITY_IDS
         ]
-        grid_down = _grid_is_down(voltage_states)
+        return _STATE_GRID_DOWN if _grid_is_down(voltage_states) else _STATE_GRID_UP
 
-        if grid_down and not self._outage_active and not self._amber_task:
-            self.on_grid_off()
-        elif not grid_down and self._outage_active and not self._restore_task:
-            self.on_grid_recovered()
-        elif not grid_down and not self._outage_active and self._amber_task:
-            # Grid came back before outage-color debounce fired — cancel it.
-            self._cancel_amber()
+    def _schedule_apply(self, target: str) -> None:
+        """Cancel any pending apply and schedule a new one for `target`.
 
-    # ------------------------------------------------------------------ #
-    # Internal scheduling                                                  #
-    # ------------------------------------------------------------------ #
-
-    def _schedule_amber(self) -> None:
-        # v0.1.14: Schedule via hass.async_create_task, NEVER loop.create_task.
-        #
-        # Python's asyncio docs warn that the event loop only keeps WEAK
-        # references to tasks created via asyncio.create_task / loop.create_task.
-        # A task that isn't strongly referenced "may get garbage collected at
-        # any time, even before it's done."
-        # https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
-        #
-        # Home Assistant's official guidance (Working with Async, developers.
-        # home-assistant.io) is to use `hass.async_create_task` from integration
-        # code: it registers the task on `hass._tasks` (strong ref), ties the
-        # task lifecycle to integration setup/teardown, and uses eager_start so
-        # the coroutine begins executing immediately rather than next loop tick.
-        #
-        # Why we cared: v0.1.13 used loop.create_task here. CTO end-to-end test
-        # 2026-05-02 — service call → on_grid_off → _schedule_amber → 65 s
-        # later the lamp had not changed. Direct REST `light.turn_on` with
-        # the same xy/brightness fired the lamp instantly, proving the lamp
-        # path was healthy and the task was being silently dropped en route.
-        self._cancel_amber()
-        self._amber_task = self._hass.async_create_task(self._debounced_amber())
-
-    def _schedule_restore(self) -> None:
-        # See _schedule_amber for full rationale. Same fix, same reason.
-        self._cancel_restore()
-        self._restore_task = self._hass.async_create_task(
-            self._debounced_restore()
+        Uses hass.async_create_task — NOT loop.create_task. v0.1.14 fix:
+        Python's asyncio loop holds only weak refs to tasks created via
+        loop.create_task, which can be GC'd mid-flight. HA's
+        `hass.async_create_task` registers the task on `hass._tasks` (strong
+        ref), ties it to integration setup/teardown, and uses eager_start.
+        """
+        self._cancel_pending()
+        self._target_state = target
+        self._pending_task = self._hass.async_create_task(
+            self._debounced_apply(target)
         )
 
-    def _cancel_amber(self) -> None:
-        if self._amber_task and not self._amber_task.done():
-            self._amber_task.cancel()
-            self._amber_task = None
+    def _cancel_pending(self) -> None:
+        if self._pending_task and not self._pending_task.done():
+            self._pending_task.cancel()
+        self._pending_task = None
 
-    def _cancel_restore(self) -> None:
-        if self._restore_task and not self._restore_task.done():
-            self._restore_task.cancel()
-            self._restore_task = None
+    async def _debounced_apply(self, target: str) -> None:
+        """Wait the debounce, re-check grid state, apply if still matching.
 
-    async def _debounced_amber(self) -> None:
+        Re-checking after the sleep guards against a race: if the grid
+        flipped back during the debounce, _evaluate_target_state() will
+        return the old colour and we skip the apply. This is belt-and-
+        braces on top of _schedule_apply's cancel-on-flip logic.
+        """
+        debounce_s = (
+            GRID_OFF_DEBOUNCE_S if target == _STATE_GRID_DOWN
+            else GRID_ON_DEBOUNCE_S
+        )
         try:
-            await asyncio.sleep(GRID_OFF_DEBOUNCE_S)
+            await asyncio.sleep(debounce_s)
         except asyncio.CancelledError:
-            log.debug("edge_poc: outage-color debounce cancelled (grid recovered before threshold)")
+            log.debug("edge_poc: debounce cancelled (target=%s)", target)
             return
 
+        # Re-evaluate after the sleep — if grid flipped back, abandon.
+        actual = self._evaluate_target_state()
+        if actual != target:
+            log.debug(
+                "edge_poc: state flipped during debounce (target=%s, actual=%s) — skipping apply",
+                target, actual,
+            )
+            self._target_state = actual
+            return
+
+        await self._apply_now(target)
+
+    async def _apply_now(self, target: str) -> None:
+        """Paint the lamp the target colour and log the event.
+
+        Used by _debounced_apply (post-debounce) and by async_start
+        (immediate startup paint, no debounce).
+        """
         t0 = time.monotonic()
-        prior: dict[str, Any] | None = None
         success = False
+        event_type = (
+            "grid_off_fire" if target == _STATE_GRID_DOWN
+            else "grid_recovered_apply"
+        )
         try:
-            prior = await capture_lamp_state(self._hass, LAMP_ENTITY_ID)
-            self._prior_state = prior
-            await apply_outage_color(self._hass, LAMP_ENTITY_ID, prior)
-            self._outage_active = True
+            if target == _STATE_GRID_DOWN:
+                await apply_outage_color(self._hass, LAMP_ENTITY_ID)
+            else:
+                await apply_grid_up_color(self._hass, LAMP_ENTITY_ID)
+            self._target_state = target
             success = True
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            log.error("edge_poc: outage-color apply failed: %s: %s", type(exc).__name__, exc)
+            log.error(
+                "edge_poc: apply failed (target=%s): %s: %s",
+                target, type(exc).__name__, exc,
+            )
         finally:
             latency_ms = int((time.monotonic() - t0) * 1000)
-            log_event(self._db_path, "grid_off_fire", latency_ms, prior, success)
-
-    async def _debounced_restore(self) -> None:
-        try:
-            await asyncio.sleep(GRID_ON_DEBOUNCE_S)
-        except asyncio.CancelledError:
-            log.debug("edge_poc: restore debounce cancelled (grid dropped again)")
-            return
-
-        self._outage_active = False
-        t0 = time.monotonic()
-        prior: dict[str, Any] | None = None
-        success = False
-        event_type = "grid_recovered_restore"
-        try:
-            # Use in-memory prior if available; fall back to HA Storage
-            prior = self._prior_state
-            if prior is None:
-                prior = await _load_persisted_state(self._hass)
-
-            if prior is None:
-                # Scenario C: state lost — fail-safe off
-                log.warning(
-                    "edge_poc: prior state not found — turning lamp off (fail-safe)"
-                )
-                await self._hass.services.async_call(
-                    "light", "turn_off",
-                    {"entity_id": LAMP_ENTITY_ID}, blocking=True,
-                )
-                event_type = "restore_fail_no_prior_state"
-                success = False
-            else:
-                await restore_state(self._hass, LAMP_ENTITY_ID, prior)
-                await _clear_persisted_state(self._hass)
-                self._prior_state = None
-                success = True
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            log.error("edge_poc: restore failed: %s: %s", type(exc).__name__, exc)
-            event_type = "restore_fail_lamp_error"
-        finally:
-            latency_ms = int((time.monotonic() - t0) * 1000)
-            log_event(self._db_path, event_type, latency_ms, prior, success)
+            log_event(self._db_path, event_type, latency_ms, None, success)
 
     # ------------------------------------------------------------------ #
-    # Startup — re-arm if grid is already down (HA restart mid-outage)    #
+    # Lifecycle                                                            #
     # ------------------------------------------------------------------ #
 
     async def async_start(self) -> None:
-        """Subscribe to voltage state changes + check grid state on startup.
+        """Subscribe to voltage state changes + paint current state immediately.
 
-        v0.1.13 P0 fix (CEO directive 2026-05-02): subscribe to
-        async_track_state_change_event for all 4 canonical voltage entities so
-        the handler fires automatically on voltage transitions. v0.1.12 was
-        deaf — it registered services but never wired a listener, so the only
-        way to fire the lamp during an outage was a manual service call or a
-        user-wired YAML automation. Neither is acceptable for one-tap install.
+        v0.1.15: on integration load, the lamp is painted to the matching
+        grid-state colour right away — no 60s debounce on first apply. The
+        debounce only matters for transitions, not initial state. Without
+        this, a user installing the integration would see no lamp change
+        for a full minute even though grid state is known instantly from
+        the live voltage entities.
 
-        Also handles Scenario A (HA restart mid-outage): all voltages already
-        NULL/low, lamp already showing outage color, storage has prior state.
-        We mark outage_active so restore fires when grid returns — no re-fire
-        since lamp is already in the outage color.
+        v0.1.13 P0 fix preserved: subscribe to async_track_state_change_event
+        for all 4 canonical voltage entities so the handler fires automatically
+        on voltage transitions (no YAML automation required).
         """
-        # Auto-subscribe to voltage state-changes — this is the core fix.
-        # Wrap the import + subscribe so that test environments without HA
-        # installed still allow the rest of async_start to run (services and
-        # the one-time grid check still work; only the auto-fire path is lost).
+        # Auto-subscribe to voltage state-changes — v0.1.13 fix.
+        # Wrap the import + subscribe so test environments without HA installed
+        # still allow async_start to run.
         try:
             from homeassistant.helpers.event import (  # type: ignore[import]
                 async_track_state_change_event,
@@ -590,37 +500,74 @@ class EdgePocOutageHandler:
                 len(VOLTAGE_ENTITY_IDS),
             )
         except ImportError as exc:
-            # Test environment without HA installed — keep the handler usable
-            # via registered services. Production HA will always have these.
             log.warning(
                 "edge_poc: HA helpers unavailable (%s) — running in service-only"
                 " mode; voltage auto-subscribe disabled",
                 exc,
             )
-        except Exception as exc:  # noqa: BLE001 — never let async_start kill setup
+        except Exception as exc:  # noqa: BLE001
             log.error(
                 "edge_poc: unexpected error wiring state-change subscription:"
                 " %s: %s — falling back to service-only mode",
-                type(exc).__name__,
-                exc,
+                type(exc).__name__, exc,
             )
 
-        voltage_states = [
-            self._hass.states.get(eid) for eid in VOLTAGE_ENTITY_IDS
-        ]
-        if _grid_is_down(voltage_states):
-            log.info(
-                "edge_poc: startup: all voltages NULL/<50V — marking outage active"
-                " (HA restart mid-outage scenario)",
+        # Initial paint — no debounce. Whatever the grid is doing right now,
+        # the lamp must reflect it within seconds of integration load.
+        target = self._evaluate_target_state()
+        log.info("edge_poc: startup state evaluation → target=%s", target)
+
+        # Special case: if the voltage check was inconclusive, _evaluate_target_state
+        # returns _STATE_GRID_UP (fail-safe-up). We don't want to lie by painting
+        # cool-white when we genuinely don't know the grid state. Distinguish by
+        # checking whether ANY voltage entity is reporting a fresh numeric value.
+        if not self._has_any_fresh_voltage_reading():
+            log.warning(
+                "edge_poc: startup: no fresh voltage readings yet — deferring"
+                " initial paint until first voltage state-change event"
             )
-            self._outage_active = True
-            # Load persisted prior state if available
-            self._prior_state = await _load_persisted_state(self._hass)
+            return
+
+        await self._apply_now(target)
+
+    def _has_any_fresh_voltage_reading(self) -> bool:
+        """True iff at least one voltage entity has a fresh numeric reading.
+
+        Used at startup to distinguish "grid is genuinely up" from "we just
+        booted and entities haven't populated yet". In the latter case we
+        defer the initial paint to the first state-change event — the lamp
+        keeps whatever state the user left it in rather than getting falsely
+        painted cool-white.
+        """
+        now = time.time()
+        for eid in VOLTAGE_ENTITY_IDS:
+            state_obj = self._hass.states.get(eid)
+            if state_obj is None:
+                continue
+            raw = state_obj.state
+            if raw in ("unavailable", "unknown", None):
+                continue
+            last_updated = getattr(state_obj, "last_updated", None)
+            if last_updated is not None:
+                try:
+                    if hasattr(last_updated, "timestamp"):
+                        lu_epoch = last_updated.timestamp()
+                    else:
+                        lu_epoch = float(last_updated)
+                    if now - lu_epoch > STALE_WINDOW_S:
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            try:
+                float(raw)
+            except (ValueError, TypeError):
+                continue
+            return True
+        return False
 
     def stop(self) -> None:
         """Cancel pending tasks on integration unload."""
-        self._cancel_amber()
-        self._cancel_restore()
+        self._cancel_pending()
         for unsub in self._unsub:
             try:
                 unsub()
@@ -635,13 +582,12 @@ class EdgePocOutageHandler:
 
 
 def register_services(hass, handler: EdgePocOutageHandler) -> None:
-    """Register iems.edge_poc_outage_voltage_change service.
+    """Register the three iems.edge_poc_outage_* services.
 
-    This service is called by the automation YAML on any voltage entity
-    state change; the handler runs the AND-of-all check internally.
-
-    The grid_off / grid_recovered services are kept for direct invocation
-    from automation YAML (HA numeric_state below/above triggers) and tests.
+    All three delegate to handle_voltage_state_change so that the lamp
+    always reflects ACTUAL grid state, not user fiction. The grid_off /
+    grid_recovered names are kept for back-compat with existing user
+    automations from v0.1.14 and earlier.
     """
 
     async def _handle_voltage_change(call) -> None:  # noqa: ARG001
@@ -677,7 +623,6 @@ def resolve_db_path(hass) -> str:
     config_path_fn = getattr(hass.config, "path", None)
     if callable(config_path_fn):
         return config_path_fn(SQLITE_FILENAME)
-    # Test / fallback
     import os
     config_dir = os.environ.get("HASS_CONFIG", "/tmp")
     return str(Path(config_dir) / SQLITE_FILENAME)
