@@ -4,7 +4,7 @@ DOMAIN = "iems"
 # Sprint 6 (2026-05-24): per-minute aggregation in HACS — material architecture
 # change (was raw state_changed forwarding).  Bumping to 0.2.0 so support has a
 # clean cut-line between "raw events" and "pre-aggregated minute rows".
-VERSION = "0.2.5"
+VERSION = "0.2.6"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"
@@ -93,11 +93,40 @@ SCHEMA_VERSION = "0.6.0"
 # freshness_signal_heartbeat_vs_telemetry_2026-05-26.md.
 MAX_ENTITIES_PER_BATCH = 5000
 
-# Publish-side cap on entities per MQTT message. AWS IoT Core's MQTT v3.1.1
-# message limit is 128 KiB; at ~180 bytes/row that's ~700 rows safely under
-# the limit with headroom for the wrapper fields (source, batch_id, ts, etc.).
-# When a flush produces more rows than this, coordinator.flush() splits the
-# row set into sequential chunks, each its own batch with a fresh batch_id.
-# Distinct from MAX_ENTITIES_PER_BATCH (schema cap) by design: the schema
-# allows up to 5000 per batch, but a single MQTT message can't carry that.
-MAX_ENTITIES_PER_BATCH_PUBLISH = 700
+# Publish-side cap on entities per MQTT message.
+#
+# AWS IoT Core MQTT message size hard limit: 128 KiB (131072 bytes).
+# Reference: https://docs.aws.amazon.com/general/latest/gr/iot-core.html
+#            #message-broker-limits
+#
+# v0.2.6 (2026-05-27): LOWERED 700 → 200.  The original v0.2.1 sizing used
+# ~180 bytes/row, but v0.2.4's `_clean_attributes` value coercion now
+# PRESERVES set/tuple/dict attribute values that were previously dropped.
+# Realistic measurement on a mixed inverter/MTronic/Hue/climate workload
+# (scripts/size_realistic_batch.py) shows ~384 bytes/row average.  At 700
+# rows the payload was ~262 KiB — broker silently rejected with
+# Publish-In Failure reason=PAYLOAD_LIMIT_EXCEEDED, then disconnected
+# with CLIENT_ERROR.  Tight reconnect-publish-reject loop was the
+# root cause of the 2026-05-27 telemetry-dead incident (broker logs
+# confirmed by Sarah).
+#
+# Chunk cap math at 200 rows:
+#   200 * ~384 bytes = ~76.8 KiB worst-case observed
+#   leaves ~50 KiB headroom for outlier-heavy entities (Z-Wave
+#   `option_groups`, multi-zone climate, scene platforms)
+#   well under the 100 KiB soft safety threshold and the
+#   131072-byte hard broker limit
+#
+# Distinct from MAX_ENTITIES_PER_BATCH (schema cap, 5000) by design:
+# the schema allows up to 5000 per batch logically, but a single MQTT
+# message can't carry that.  v0.2.7 may revisit this with dynamic
+# size-based chunking (see release notes); v0.2.6 ships the static
+# lower cap as the immediate hotfix.
+MAX_ENTITIES_PER_BATCH_PUBLISH = 200
+
+# Hard limit per AWS IoT Core MQTT v3.1.1.  Used as a defensive guard in
+# iot_core.publish() — any payload exceeding this is rejected pre-publish
+# with PayloadTooLargeError (no broker round-trip, no reconnect storm).
+# Set EXACTLY to the broker's documented limit so we never enqueue or
+# retry a payload that we KNOW the broker will reject.
+MQTT_MESSAGE_SIZE_HARD_LIMIT_BYTES = 131072

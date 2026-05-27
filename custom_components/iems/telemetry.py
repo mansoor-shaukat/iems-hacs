@@ -212,6 +212,10 @@ def build_heartbeat(
     last_flush_iso: str | None = None,
     last_flush_row_count: int | None = None,
     last_publish_error: str | None = None,
+    last_publish_payload_bytes: int | None = None,
+    payload_too_large_count: int | None = None,
+    client_error_disconnects: int | None = None,
+    last_disconnect_reason: str | None = None,
 ) -> dict:
     """Heartbeat payload — shape per hacs_spec.md §3f.
 
@@ -255,4 +259,23 @@ def build_heartbeat(
     if last_flush_row_count is not None:
         payload["last_flush_row_count"] = int(last_flush_row_count)
     payload["last_publish_error"] = last_publish_error
+    # v0.2.6 (2026-05-27) — payload-size observability.  Surfaces
+    # IotCorePublisher's pre-publish size guard so we can see
+    # PAYLOAD_LIMIT_EXCEEDED rejections in DDB without broker logs.
+    # `last_publish_payload_bytes` is the most-recent attempt size (any
+    # topic).  `payload_too_large_count` is the cumulative rejection
+    # counter since uptime.  Both emit only when iot_core actually
+    # provides them (tests with MagicMock publish_fn omit).
+    if last_publish_payload_bytes is not None:
+        payload["last_publish_payload_bytes"] = int(last_publish_payload_bytes)
+    if payload_too_large_count is not None:
+        payload["payload_too_large_count"] = int(payload_too_large_count)
+    # v0.2.6 — broker-rejection observability.  CLIENT_ERROR-class
+    # disconnects (PAYLOAD_LIMIT_EXCEEDED, PROTOCOL_ERROR, etc.) bump
+    # `client_error_disconnects`; `last_disconnect_reason` carries the
+    # awscrt error string (truncated 200 chars) for diagnosis.
+    if client_error_disconnects is not None:
+        payload["client_error_disconnects"] = int(client_error_disconnects)
+    if last_disconnect_reason is not None:
+        payload["last_disconnect_reason"] = str(last_disconnect_reason)
     return payload

@@ -23,6 +23,7 @@ from typing import Any
 from .auth import IemsAuthProvider
 from .const import (
     MQTT_CONNECT_TIMEOUT_SECONDS,
+    MQTT_MESSAGE_SIZE_HARD_LIMIT_BYTES,
     MQTT_PUBLISH_RETRY_ATTEMPTS,
     MQTT_PUBLISH_RETRY_INITIAL_SECONDS,
     MQTT_PUBLISH_RETRY_MAX_SECONDS,
@@ -30,6 +31,33 @@ from .const import (
 )
 
 log = logging.getLogger("iems.iot_core")
+
+
+class PayloadTooLargeError(Exception):
+    """Raised pre-publish when payload exceeds AWS IoT Core's 128 KiB MQTT limit.
+
+    v0.2.6 (2026-05-27).  Sized payloads that we KNOW the broker will reject
+    must not enter the publish path — pre-v0.2.6 they were sent, the broker
+    rejected with Publish-In Failure reason=PAYLOAD_LIMIT_EXCEEDED, then
+    disconnected with CLIENT_ERROR.  awscrt auto-reconnected and HACS
+    retried the same oversized payload, producing a tight reconnect-publish-
+    reject loop while heartbeats (small) sailed through.  That was the root
+    cause of the 2026-05-27 telemetry-dead incident.
+
+    This exception is raised pre-flight (before any broker round-trip) and
+    is NOT in the retry whitelist nor the publisher-queue catch tuple — the
+    coordinator drops the batch loudly.  Data loss on this one oversized
+    payload is preferable to a reconnect storm that masks every subsequent
+    publish.
+
+    The right fix is upstream: cap chunk size in coordinator.flush() so the
+    payload never gets near the limit.  This guard is the belt-and-braces
+    that catches any miss in that sizing (e.g. an entity with an outlier
+    attribute payload that pushes the chunk over the line).
+
+    Reference: AWS IoT Core message broker limits
+    https://docs.aws.amazon.com/general/latest/gr/iot-core.html#message-broker-limits
+    """
 
 # v0.2.3 (2026-05-26) — substring-match these awscrt error tokens to decide a
 # publish attempt is retry-eligible.  We match on str(exc) because awscrt
@@ -87,6 +115,67 @@ class IotCorePublisher:
         # Captured at connect() time; reused by awscrt threadpool callbacks
         # to post state changes back to HA's asyncio loop via call_soon_threadsafe.
         self._event_loop: asyncio.AbstractEventLoop | None = None
+        # v0.2.6 (2026-05-27) — payload-size observability + rejection counter.
+        # Surfaced through the heartbeat so DDB tells us "we tried to publish X
+        # bytes; broker hard limit is 128 KiB" without needing broker logs or
+        # HA log access.  Reset only on integration reload, NOT on reconnect.
+        self._last_publish_payload_bytes: int = 0
+        self._payload_too_large_count: int = 0
+        # v0.2.6 — observability for broker-side disconnects that look like
+        # publish-rejection signals (CLIENT_ERROR / PROTOCOL_ERROR family).
+        # Pre-v0.2.6, these were logged as transient "connection interrupted"
+        # and awscrt auto-reconnected, hiding the broker rejection.  This
+        # counter surfaces them in the heartbeat row so we notice broker-side
+        # rejections we don't currently catch with a specific guard.  See
+        # `_on_interrupted` for the classification tokens.
+        self._client_error_disconnects: int = 0
+        self._last_disconnect_reason: str | None = None
+
+    @property
+    def last_publish_payload_bytes(self) -> int:
+        """Size in bytes of the most recent publish attempt (any topic, any QoS).
+
+        Set in `publish()` after JSON-encoding the payload, BEFORE the
+        size-limit check.  A value above MQTT_MESSAGE_SIZE_HARD_LIMIT_BYTES
+        means the last publish was rejected pre-flight with
+        PayloadTooLargeError — cross-check against
+        `payload_too_large_count`.
+        """
+        return self._last_publish_payload_bytes
+
+    @property
+    def payload_too_large_count(self) -> int:
+        """Total count of publish attempts rejected by the size guard since uptime.
+
+        Non-zero is a signal that coordinator-side chunking is undersized:
+        either MAX_ENTITIES_PER_BATCH_PUBLISH is too high for the current
+        attribute mix, or some entity has an outlier attribute payload
+        pushing the chunk over the line.
+        """
+        return self._payload_too_large_count
+
+    @property
+    def client_error_disconnects(self) -> int:
+        """Count of broker disconnects classified as rejection-shaped (CLIENT_ERROR).
+
+        Bumped by `_on_interrupted` when the awscrt error string matches a
+        known broker-side rejection signal (CLIENT_ERROR / PROTOCOL_ERROR
+        / SERVER_INVALID_DATA).  Heartbeat surfaces this so silent broker
+        rejections don't hide behind awscrt's "transient interruption +
+        auto-reconnect" abstraction (which was the 2026-05-27 root-cause
+        masking pattern — broker disconnected with CLIENT_ERROR every
+        oversized publish, awscrt called it transient).
+        """
+        return self._client_error_disconnects
+
+    @property
+    def last_disconnect_reason(self) -> str | None:
+        """Most recent disconnect error string (truncated to 200 chars).
+
+        None until the first interruption.  Pairs with
+        `client_error_disconnects` for diagnosis in DDB.
+        """
+        return self._last_disconnect_reason
 
     # ------------------------------------------------------------------
     # Public interface
@@ -154,6 +243,39 @@ class IotCorePublisher:
                 ) from exc
 
         payload_bytes = json.dumps(payload, separators=(",", ":")).encode()
+        # v0.2.6: observability counter.  Set BEFORE the size-limit check so
+        # `last_publish_payload_bytes` reflects the size we attempted even if
+        # the guard rejects it.  Heartbeat surfaces this so DDB sees the
+        # rejection without needing broker logs.
+        self._last_publish_payload_bytes = len(payload_bytes)
+
+        # v0.2.6: pre-publish size guard.  AWS IoT Core MQTT v3.1.1 caps
+        # message size at 128 KiB (131072 bytes).  Sending a larger payload
+        # produces Publish-In Failure reason=PAYLOAD_LIMIT_EXCEEDED followed
+        # by a Disconnect with reason=CLIENT_ERROR — which awscrt treats as
+        # transient and auto-reconnects, only to have HACS retry the same
+        # oversized payload.  That tight loop was the 2026-05-27 telemetry-
+        # dead incident.  Reject pre-flight with a SPECIFIC exception that is
+        # NOT in the retry whitelist and NOT in the publisher-queue catch
+        # tuple — coordinator drops the batch loudly.  Data loss on one
+        # oversized payload is preferable to a reconnect storm.
+        if len(payload_bytes) > MQTT_MESSAGE_SIZE_HARD_LIMIT_BYTES:
+            self._payload_too_large_count += 1
+            log.error(
+                "iot_core: payload too large topic=%s size_bytes=%d "
+                "hard_limit=%d rejections_total=%d — DROPPING "
+                "(see MAX_ENTITIES_PER_BATCH_PUBLISH in const.py)",
+                topic,
+                len(payload_bytes),
+                MQTT_MESSAGE_SIZE_HARD_LIMIT_BYTES,
+                self._payload_too_large_count,
+            )
+            raise PayloadTooLargeError(
+                f"Payload size {len(payload_bytes)} bytes exceeds "
+                f"AWS IoT Core MQTT hard limit "
+                f"{MQTT_MESSAGE_SIZE_HARD_LIMIT_BYTES} bytes on topic={topic}"
+            )
+
         qos_enum = self._qos_enum(qos)
 
         # v0.2.3 retry loop — re-issues the publish on AWS_ERROR_MQTT_CANCELLED_
@@ -268,8 +390,32 @@ class IotCorePublisher:
         self._event_loop = asyncio.get_event_loop()
 
         def _on_interrupted(connection, error, **_kwargs) -> None:
-            """Called on awscrt thread when TCP/MQTT link drops."""
-            log.warning("iot_core: connection interrupted: %s", error)
+            """Called on awscrt thread when TCP/MQTT link drops.
+
+            v0.2.6: classify the interruption.  awscrt treats every
+            disconnect as transient and auto-reconnects, which hides
+            broker-side rejections (CLIENT_ERROR / PROTOCOL_ERROR /
+            SERVER_INVALID_DATA) — the 2026-05-27 PAYLOAD_LIMIT_EXCEEDED
+            disconnects were silent through this path.  We bump a counter
+            and capture the last disconnect reason so the heartbeat
+            surfaces broker rejections.  We do NOT alter the publish-
+            success path here — that is the size guard's job (raised
+            pre-flight in publish()), this is observability only.
+            """
+            error_str = str(error)
+            log.warning("iot_core: connection interrupted: %s", error_str)
+            # Classify broker-side rejection-shaped disconnects.  Token
+            # list intentionally narrow: only the failure modes the broker
+            # uses to terminate a session for malformed/oversized publishes.
+            _CLIENT_ERROR_TOKENS = (
+                "CLIENT_ERROR",
+                "PROTOCOL_ERROR",
+                "SERVER_INVALID_DATA",
+                "PAYLOAD_LIMIT",
+            )
+            if any(tok in error_str for tok in _CLIENT_ERROR_TOKENS):
+                self._client_error_disconnects += 1
+            self._last_disconnect_reason = error_str[:200]
             loop = self._event_loop
             if loop is not None and loop.is_running():
                 loop.call_soon_threadsafe(self._mark_disconnected)

@@ -544,6 +544,31 @@ class IemsCoordinator:
     async def heartbeat_once(self) -> None:
         ha_version = getattr(self._hass.config, "version", "unknown")
         entity_count, total_samples, pending = self._accumulator_stats()
+        # v0.2.6 — payload-size observability.  The publisher delegates to
+        # IotCorePublisher (via the injected publish_fn), so reach through
+        # to the underlying iot_core instance for these counters.  Guarded
+        # with getattr so tests using a plain MagicMock publish_fn don't
+        # break: missing counter defaults to None (heartbeat omits field).
+        iot_core = getattr(self._publisher, "_publish_fn", None)
+        # publish_fn is a bound method on IotCorePublisher in production;
+        # __self__ gets us back to the instance.
+        iot_core_instance = getattr(iot_core, "__self__", None) if iot_core else None
+        last_publish_payload_bytes = (
+            getattr(iot_core_instance, "last_publish_payload_bytes", None)
+            if iot_core_instance is not None else None
+        )
+        payload_too_large_count = (
+            getattr(iot_core_instance, "payload_too_large_count", None)
+            if iot_core_instance is not None else None
+        )
+        client_error_disconnects = (
+            getattr(iot_core_instance, "client_error_disconnects", None)
+            if iot_core_instance is not None else None
+        )
+        last_disconnect_reason = (
+            getattr(iot_core_instance, "last_disconnect_reason", None)
+            if iot_core_instance is not None else None
+        )
         hb = build_heartbeat(
             user_id=self._user_id,
             ha_version=ha_version,
@@ -560,6 +585,11 @@ class IemsCoordinator:
             last_flush_iso=self._last_flush_iso,
             last_flush_row_count=self._last_flush_row_count,
             last_publish_error=self._last_publish_error,
+            # v0.2.6 — payload-size observability.
+            last_publish_payload_bytes=last_publish_payload_bytes,
+            payload_too_large_count=payload_too_large_count,
+            client_error_disconnects=client_error_disconnects,
+            last_disconnect_reason=last_disconnect_reason,
         )
         await self._publisher.publish_heartbeat(hb)
         # Drain any backlogged batches the publisher accumulated while the
