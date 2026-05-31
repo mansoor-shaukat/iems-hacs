@@ -1,0 +1,88 @@
+# GitHub Actions workflow — Sprint-7 Phase 4 promotion gate.
+#
+# Copy this file VERBATIM into the public testing repo at:
+#   mansoor-shaukat/iems-ha-test/.github/workflows/staging-smoke.yml
+#
+# After the iems-dev-data stack has been deployed with the Phase-4 changes,
+# the role ARN appears in:
+#   aws cloudformation describe-stacks --stack-name iems-dev-data \
+#     --query 'Stacks[0].Outputs[?OutputKey==`StagingSmokeGhaRoleArn`].OutputValue' \
+#     --output text
+# Paste that ARN into the `role-to-assume` field below (replacing the placeholder).
+#
+# Prerequisites the workflow assumes:
+#   1. The CEO's staging-HA Docker stack is running locally (or in another
+#      always-on host) for at least 30 minutes BEFORE a tag is pushed. The
+#      smoke Lambda evaluates the trailing 30-min window of DDB rows; if
+#      staging just started, C2 will fail (correctly).
+#   2. The IAM role iems-dev-staging-smoke-gha exists in account 027613215010
+#      (deployed via CDK).
+#   3. This repo has the OIDC trust policy enabled at the org or repo level
+#      — no extra secrets, no static AWS access keys.
+
+name: Staging smoke
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# OIDC requires id-token: write. contents: read is fine for tag-triggered runs.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  smoke:
+    name: Run staging smoke against the tagged HACS release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Replace with the StagingSmokeGhaRoleArn CFN output post-deploy.
+          role-to-assume: arn:aws:iam::027613215010:role/iems-dev-staging-smoke-gha
+          aws-region: eu-central-1
+          role-session-name: gha-staging-smoke-${{ github.run_id }}
+
+      - name: Invoke the staging_smoke Lambda
+        id: smoke
+        run: |
+          set -euo pipefail
+          aws lambda invoke \
+            --function-name iems-dev-staging-smoke \
+            --invocation-type RequestResponse \
+            --cli-binary-format raw-in-base64-out \
+            --payload '{}' \
+            /tmp/smoke.json \
+            --query '{StatusCode:StatusCode,FunctionError:FunctionError}' \
+            --output json
+
+          echo "::group::Smoke result"
+          cat /tmp/smoke.json
+          echo "::endgroup::"
+
+          status=$(jq -r '.status' /tmp/smoke.json)
+          echo "result=$status" >> "$GITHUB_OUTPUT"
+
+          if [ "$status" != "pass" ]; then
+            echo "::error::Smoke FAILED — see CloudWatch logs for iems-dev-staging-smoke"
+            echo "::group::Failing checks"
+            jq '.checks | to_entries[] | select(.value.pass == false) | {check: .key, reason: .value.reason}' /tmp/smoke.json
+            echo "::endgroup::"
+            exit 1
+          fi
+          echo "::notice::Smoke PASSED on tag ${{ github.ref_name }}"
+
+      # Phase-4b (not yet wired): on pass, open a promotion PR in the main
+      # iems repo bumping HACS install instructions to this tag. Requires a
+      # cross-repo write token (GitHub App or PAT) in repo secrets. Until
+      # that lands, CEO sees the green check on this workflow run and
+      # manually decides whether to bump the prod-HA HACS version.
+      - name: Phase-4b TODO — open promotion PR on iems repo
+        if: steps.smoke.outputs.result == 'pass'
+        run: |
+          echo "::notice::Tag ${{ github.ref_name }} cleared staging smoke."
+          echo "::notice::Phase-4b (cross-repo PR-open) is not wired yet."
+          echo "::notice::To promote: manually bump the HACS install version in CEO's prod HA."
