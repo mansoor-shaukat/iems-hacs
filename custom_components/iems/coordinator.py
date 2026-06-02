@@ -60,8 +60,12 @@ from typing import Any
 from .classifier import classify
 from .const import (
     BATCH_WINDOW_SECONDS,
+    ENERGY_DELTA_THRESHOLD_KWH,
     HEARTBEAT_INTERVAL_SECONDS,
+    HUMIDITY_DELTA_THRESHOLD_PCT,
     MAX_ENTITIES_PER_BATCH_PUBLISH,
+    SOC_DELTA_THRESHOLD_PCT,
+    TEMPERATURE_DELTA_THRESHOLD_C,
 )
 from .mtronic_dispatch import DispatchCapture
 from .telemetry import EmptyBatchError, build_batch, build_heartbeat
@@ -78,12 +82,98 @@ _NUMERIC_CATEGORIES: frozenset[str] = frozenset({
     "sensor.power",
     "sensor.energy",
     "meter.energy",
+    # 2026-05-31 — sensor.temperature + sensor.humidity were missing here.
+    # Climate entities pass through HA as strings ("94.1"); without coercion
+    # they hit ingestion as strings and the numeric-only TS# guard skips
+    # them silently. Phase-3 staging smoke caught this on its first run
+    # (4 climate entities = 0 TS# rows in DDB while LATEST# was string-typed).
+    # Both are legitimate numeric measurements — charting needs the TS# rows.
+    "sensor.temperature",
+    "sensor.humidity",
 })
 
 # Cap the number of finalised minute-rows we ship per entity per flush.
 # At a 5-min flush window we expect at most 5 finalised minutes per entity,
 # but defensive in case a publisher backlog forces a delayed flush.
 _MAX_ROWS_PER_ENTITY: int = 5
+
+# ----------------------------------------------------------------------------
+# v0.3.0 send-policy — CEO-locked 2026-05-31.
+# Per docs/architecture/send_policy.md, every classified category maps to one
+# of four buckets that decide whether a per-minute accumulator row gets
+# emitted to the wire.  Threshold values live in const.py (named, testable,
+# tunable).
+#
+#   "always"       — emit every minute that had ≥1 state_changed (the v0.2.x
+#                    default behaviour).  Fast-moving signals where the
+#                    minute-by-minute curve IS the product.
+#   "threshold"    — emit only when |finalised_mean - last_emitted_state| ≥
+#                    `threshold`.  Slow-moving numerics whose chart can
+#                    hold-last between meaningful steps.
+#   "latest_only"  — no per-minute accumulator at all.  Emit ONE row only
+#                    when the value actually changes; cloud-side this lands
+#                    LATEST# and TS# naturally skips because the state is
+#                    non-numeric (switch/light/climate.mode/text).
+#
+# State == "unavailable" / "unknown" is the universal short-circuit (see the
+# capture path): emit ONE LATEST# transition, then silent until alive.
+#
+# Categories present in `classifier.VALID_CATEGORIES` but missing here default
+# to "always" — safer than silently dropping.  Drift guard in
+# `tests/hacs/test_coordinator.py::test_send_policy_covers_every_valid_category`
+# enforces full coverage.
+# ----------------------------------------------------------------------------
+_SEND_POLICY: dict[str, dict[str, Any]] = {
+    # ---- Always — every minute, the curve IS the product -------------------
+    "inverter.pv":      {"bucket": "always",      "threshold": None},
+    "inverter.grid":    {"bucket": "always",      "threshold": None},
+    "inverter.load":    {"bucket": "always",      "threshold": None},
+    "inverter.battery": {"bucket": "always",      "threshold": None},
+    "sensor.power":     {"bucket": "always",      "threshold": None},
+    # ---- Threshold — hold-last between meaningful steps --------------------
+    "battery.soc":         {"bucket": "threshold", "threshold": SOC_DELTA_THRESHOLD_PCT},
+    "sensor.temperature":  {"bucket": "threshold", "threshold": TEMPERATURE_DELTA_THRESHOLD_C},
+    "sensor.humidity":     {"bucket": "threshold", "threshold": HUMIDITY_DELTA_THRESHOLD_PCT},
+    "sensor.energy":       {"bucket": "threshold", "threshold": ENERGY_DELTA_THRESHOLD_KWH},
+    # ---- Always (v0.3.1 fix) — instantaneous electrical measurements -------
+    # `meter.energy` is a classifier CATCH-ALL for non-power/non-energy
+    # electrical device classes: voltage, current, frequency, power_factor,
+    # apparent_power, reactive_power (see classifier.METER_DEVICE_CLASSES).
+    # The category name is historical and misleading — cumulative kWh meters
+    # route to `sensor.energy` (device_class=energy at classifier step 4),
+    # NOT here.  The v0.3.0 spec listed `meter.energy` in the threshold
+    # bucket on the assumption that it carried cumulative-energy semantics;
+    # in production it actually carries grid voltage, frequency, and current
+    # — fast-moving signals whose minute-by-minute curve IS the product.
+    #
+    # 2026-06-01 v0.3.1 incident: staging `sensor.inverter_a_staging_grid_l1_voltage`
+    # (device_class=voltage) classifies as `meter.energy`, was threshold-gated
+    # at 1.0 kWh, mains voltage drift of ~0.5 V per minute never crossed the
+    # gate → ONLY the first-boot row ever shipped for grid_l1_voltage post-deploy.
+    # CEO's canonical grid-outage detector reads grid_l1_voltage; losing TS#
+    # tracking on it breaks downstream outage detection.  Move to always.
+    "meter.energy":        {"bucket": "always",    "threshold": None},
+    # ---- Latest-only — transition-driven, no TS# ever ----------------------
+    "switch.controllable": {"bucket": "latest_only", "threshold": None},
+    "light":               {"bucket": "latest_only", "threshold": None},
+    "climate":             {"bucket": "latest_only", "threshold": None},
+    "other":               {"bucket": "latest_only", "threshold": None},
+}
+
+# Default for any category not explicitly listed (defensive — see comment above).
+_DEFAULT_POLICY: dict[str, Any] = {"bucket": "always", "threshold": None}
+
+# State strings HA uses for "not reading" — both short-circuit the send policy.
+_UNAVAILABLE_STATES: frozenset[str] = frozenset({"unavailable", "unknown"})
+
+
+def _policy_for(category: str) -> dict[str, Any]:
+    """Return the send-policy entry for a classifier category.
+
+    Unknown categories default to "always" so the failure mode is over-shipping
+    rather than silently dropping a signal class.
+    """
+    return _SEND_POLICY.get(category, _DEFAULT_POLICY)
 
 log = logging.getLogger("iems.coordinator")
 
@@ -156,6 +246,12 @@ class _MinuteAccumulator:
     unit: str | None = None
     # Attributes from the latest event in the minute (HA-state-shape).
     attributes: dict[str, Any] | None = None
+    # v0.3.0 send-policy: seeded at accumulator creation from the coordinator's
+    # per-entity `_last_emitted_state` map.  Used by threshold-bucket gating
+    # in finalise() to compare `|mean - last_emitted_state|` against the
+    # category threshold.  `None` means "no row has ever been emitted for
+    # this entity" — first-boot rule: emit unconditionally.
+    last_emitted_state: float | None = None
 
     def update_numeric(self, value: float) -> None:
         """Fold a numeric measurement into the running aggregate."""
@@ -221,6 +317,26 @@ class IemsCoordinator:
         # or queued for shipping).  Used to drop late arrivals for already-sealed
         # minutes so they don't clobber a fresher row.
         self._last_finalised_minute: dict[str, str] = {}
+
+        # v0.3.0 send-policy state — cross-minute persistence per entity.
+        #
+        # `_last_emitted_state` is the value of the most recent row this
+        # coordinator shipped to the cloud for the entity.  Persists across
+        # minutes; survives the per-minute accumulator lifecycle.  Used by:
+        #   - Threshold-bucket finalise() to compare against the candidate
+        #     mean (drop row if |mean - last| < threshold).
+        #   - Latest-only capture path to suppress same-value state_changed
+        #     events (HA fires events with no value delta — switch reasserted
+        #     OFF, light flickering brightness=0).
+        # `None` for an entity means "no row has ever been shipped" (first-boot
+        # rule: emit unconditionally on first non-unavailable event).
+        self._last_emitted_state: dict[str, Any] = {}
+
+        # Pending rows queued by the latest-only capture path (switches, lights,
+        # climate.mode, text/other).  Drained alongside finalised accumulator
+        # rows in `_drain_finalised_rows`.  One row per real state transition;
+        # no minute aggregation, no TS# rows cloud-side (state is non-numeric).
+        self._pending_latest_only_rows: list[dict[str, Any]] = []
 
         # Back-compat alias for any external reader that used to peek at
         # `coordinator.pending`.  Always an empty list now — kept so an
@@ -323,7 +439,8 @@ class IemsCoordinator:
             return
 
         category: str = classified["category"]
-        state = _coerce_state(new_state.state, category)
+        raw_state = new_state.state
+        state = _coerce_state(raw_state, category)
         minute_iso = _minute_floor(ts)
 
         # Defensive late-arrival guard: if we have already finalised a LATER
@@ -337,6 +454,59 @@ class IemsCoordinator:
             )
             return
 
+        policy = _policy_for(category)
+        bucket = policy["bucket"]
+
+        # ---- v0.3.0 unavailable/unknown short-circuit (universal) ----------
+        # HA exposes "unavailable" (integration unreachable) and "unknown"
+        # (value couldn't be parsed).  Per send_policy.md §"State = unavailable
+        # semantics": emit ONE LATEST# transition row, then silent until alive.
+        #
+        # Implementation: emit exactly one row carrying state="unavailable"
+        # (or "unknown"), clear any open accumulator for this entity, and
+        # set _last_emitted_state to the unavailable string so a subsequent
+        # alive event is detected as a real transition.  De-dupe on the
+        # already-recorded unavailable state so a flapping integration
+        # doesn't spam transition rows.
+        if isinstance(raw_state, str) and raw_state in _UNAVAILABLE_STATES:
+            prev = self._last_emitted_state.get(entity_id)
+            if prev == raw_state:
+                # Already emitted this unavailable transition — silent.
+                return
+            self._emit_transition_row(
+                entity_id=entity_id,
+                category=category,
+                state=raw_state,
+                ts=ts,
+                attrs=attrs,
+                meta=meta,
+            )
+            # Clear any open accumulator — we'll resume on the next alive
+            # event.  Don't touch _last_finalised_minute (still meaningful
+            # for late-arrival guarding when the entity comes back).
+            self._drop_accumulators_for(entity_id)
+            return
+
+        # ---- v0.3.0 latest-only bucket — emit only on real value change ---
+        # No per-minute accumulator at all.  Suppress same-value re-fires
+        # (HA happily emits state_changed for unchanged values when an
+        # attribute alone moves, or when a switch reasserts its current
+        # state).  Cloud-side: LATEST# updates, TS# naturally skipped via
+        # the ingestion Lambda's isinstance(state, (int, float)) guard.
+        if bucket == "latest_only":
+            prev = self._last_emitted_state.get(entity_id)
+            if prev == state:
+                return
+            self._emit_transition_row(
+                entity_id=entity_id,
+                category=category,
+                state=state,
+                ts=ts,
+                attrs=attrs,
+                meta=meta,
+            )
+            return
+
         key = (entity_id, minute_iso)
         acc = self._accumulators.get(key)
         if acc is None:
@@ -347,6 +517,10 @@ class IemsCoordinator:
                 brand=meta.get("brand"),
                 area=meta.get("area"),
                 unit=meta.get("unit"),
+                # v0.3.0: seed the threshold-gate baseline from the
+                # coordinator's cross-minute map.  `None` means "first
+                # row ever for this entity" — first-boot rule emits.
+                last_emitted_state=self._last_emitted_state.get(entity_id),
             )
             self._accumulators[key] = acc
 
@@ -365,6 +539,62 @@ class IemsCoordinator:
         # attribute snapshot is the one the cloud should see).
         if attrs:
             acc.attributes = attrs
+
+    # ----- v0.3.0 helpers: latest-only / unavailable transition emission ----
+
+    def _emit_transition_row(
+        self,
+        *,
+        entity_id: str,
+        category: str,
+        state: Any,
+        ts: str,
+        attrs: dict | None,
+        meta: dict,
+    ) -> None:
+        """Queue a single transition row for the latest-only / unavailable path.
+
+        These rows do NOT pass through `_MinuteAccumulator` — they ARE the
+        emitted value.  Stored in `_pending_latest_only_rows`, drained by
+        the next `_drain_finalised_rows()` call alongside finalised
+        accumulator rows.
+
+        Updates `_last_emitted_state` to suppress same-value re-fires on
+        subsequent capture events.
+        """
+        row: dict[str, Any] = {
+            "entity_id": entity_id,
+            "category": category,
+            "ts": _minute_floor(ts),
+            "state": state,
+            # Single transition event ↔ samples=1.  Keeps the cloud-side row
+            # shape stable across always / threshold / latest-only buckets.
+            "samples": 1,
+        }
+        brand = meta.get("brand")
+        area = meta.get("area")
+        unit = meta.get("unit")
+        if brand:
+            row["brand"] = brand
+        if area:
+            row["area"] = area
+        if unit:
+            row["unit"] = unit
+        if attrs:
+            row["attributes"] = attrs
+        self._pending_latest_only_rows.append(row)
+        self._last_emitted_state[entity_id] = state
+
+    def _drop_accumulators_for(self, entity_id: str) -> None:
+        """Drop every open per-minute accumulator belonging to `entity_id`.
+
+        Used when an entity transitions to unavailable: any partial
+        in-flight minute aggregation is meaningless and would otherwise
+        bleed an alive-period mean into the unavailable interval.
+        """
+        keys_to_drop = [k for k in self._accumulators if k[0] == entity_id]
+        for k in keys_to_drop:
+            self._accumulators.pop(k, None)
 
     @staticmethod
     def _extract_ts(new_state) -> str:
@@ -393,25 +623,92 @@ class IemsCoordinator:
         Keeps the current-minute accumulator(s) alive so they keep collecting
         into the next flush window.  Per-entity, retains at most
         _MAX_ROWS_PER_ENTITY most-recent minute-rows.
+
+        v0.3.0 send-policy gating:
+          - Always-bucket accumulators emit unconditionally (v0.2.x behaviour).
+          - Threshold-bucket accumulators emit only when the finalised mean
+            diverges from `_last_emitted_state` by ≥ category threshold.
+            First-boot rule: if no prior emission for the entity, emit
+            unconditionally.  When a row IS emitted, update
+            `_last_emitted_state` so future minutes gate against the
+            most recent shipped value.  Non-emitted minutes are discarded —
+            their accumulator state is lost (spec §"What threshold crossing
+            means precisely" item 5).
+          - Latest-only rows are NOT here — they pre-emit via
+            `_emit_transition_row` and live in `_pending_latest_only_rows`.
         """
         current = current_minute or self._current_minute_iso()
-        # Group finalised rows by entity_id so we can apply the per-entity cap.
-        rows_by_entity: dict[str, list[dict]] = {}
+
+        # Collect every sealed accumulator first, grouped by entity_id, sorted
+        # chronologically — the send-policy threshold gate uses an EVOLVING
+        # baseline that updates as rows are emitted, so we cannot iterate in
+        # dict-order.  When a row IS emitted, the next minute's gate compares
+        # against THAT row's value, not the original seeded baseline.
+        sealed_by_entity: dict[str, list[tuple[str, _MinuteAccumulator]]] = {}
         keys_to_drop: list[tuple[str, str]] = []
         for key, acc in self._accumulators.items():
             entity_id, minute_iso = key
             if minute_iso >= current:
                 continue  # still open — keep accumulating
             keys_to_drop.append(key)
-            row = acc.finalise()
-            rows_by_entity.setdefault(entity_id, []).append(row)
-            # Track high-water mark so late arrivals get dropped.
+            sealed_by_entity.setdefault(entity_id, []).append((minute_iso, acc))
+            # Track high-water mark so late arrivals get dropped, even when
+            # the send-policy gate ends up suppressing this minute's row.
             prev = self._last_finalised_minute.get(entity_id)
             if prev is None or minute_iso > prev:
                 self._last_finalised_minute[entity_id] = minute_iso
 
         for key in keys_to_drop:
             self._accumulators.pop(key, None)
+
+        # v0.3.0: emit per-entity in chronological order, threading the
+        # evolving baseline through the gate.
+        rows_by_entity: dict[str, list[dict]] = {}
+        for entity_id, minute_accs in sealed_by_entity.items():
+            minute_accs.sort(key=lambda pair: pair[0])
+            for minute_iso, acc in minute_accs:
+                row = acc.finalise()
+                policy = _policy_for(acc.category)
+                bucket = policy["bucket"]
+                if bucket == "threshold" and acc.is_numeric:
+                    threshold = policy["threshold"]
+                    candidate_state = row.get("state")
+                    last_emitted = self._last_emitted_state.get(entity_id)
+                    # First-boot rule: emit unconditionally on the first row.
+                    # Otherwise gate on |mean - last_emitted| ≥ threshold.
+                    if (
+                        last_emitted is not None
+                        and isinstance(candidate_state, (int, float))
+                        and isinstance(last_emitted, (int, float))
+                        and threshold is not None
+                        and abs(candidate_state - last_emitted) < threshold
+                    ):
+                        # Suppress this minute's row.  `_last_emitted_state`
+                        # stays at whatever value last got published (spec
+                        # §"What threshold crossing means precisely" item 4:
+                        # keeps the gate from drifting closed during slow
+                        # creep — small per-minute deltas accumulate against
+                        # the unchanging baseline until they cross).
+                        log.debug(
+                            "send-policy: drop %s minute %s (mean=%.3f vs "
+                            "last=%.3f below threshold %.3f)",
+                            entity_id, minute_iso, candidate_state,
+                            last_emitted, threshold,
+                        )
+                        continue
+                    # Emit: update baseline to the value we just shipped.
+                    if isinstance(candidate_state, (int, float)):
+                        self._last_emitted_state[entity_id] = float(candidate_state)
+                elif bucket == "always" and acc.is_numeric:
+                    # Always-bucket numeric: every minute ships.  Keep
+                    # `_last_emitted_state` in sync so a subsequent
+                    # classifier change (always → threshold) gates
+                    # correctly on the next tune cycle.
+                    candidate_state = row.get("state")
+                    if isinstance(candidate_state, (int, float)):
+                        self._last_emitted_state[entity_id] = float(candidate_state)
+
+                rows_by_entity.setdefault(entity_id, []).append(row)
 
         # Cap each entity to the _MAX_ROWS_PER_ENTITY most recent minute-rows.
         out: list[dict] = []
@@ -425,6 +722,58 @@ class IemsCoordinator:
                 )
                 rows = rows[-_MAX_ROWS_PER_ENTITY:]
             out.extend(rows)
+
+        # v0.3.0: append pending latest-only transition rows (switches,
+        # lights, climate.mode, unavailable transitions).  These already
+        # carry their own `ts` (minute-floored at capture) and were filtered
+        # at capture-time for same-value re-fires.
+        #
+        # v0.3.2 fix (staging 2026-06-01): an unavailable/unknown transition
+        # row must NOT clobber a same-batch numeric recovery row at the cloud.
+        # The cloud ingestion Lambda upserts LATEST# unconditionally in batch
+        # array order (last row for an entity wins) — see
+        # infra/lambdas/ingestion/handler.py `_write_latest`.  A mid-minute
+        # `<value> → unavailable → <value>` flap (observed verbatim on
+        # sensor.living_room_climate_staging_temperature) emits BOTH a
+        # finalised numeric value row AND an unavailable transition row that
+        # floor to the SAME minute `ts`.  With the transition row appended
+        # last, the stale outage blip won LATEST# and froze the entity at
+        # "unavailable" until a later minute happened to ship — a ~2.5h gap in
+        # production because the coordinator was torn down before that
+        # happened.  Per send_policy.md §"State == unavailable semantics":
+        # `unavailable → <value>` MUST surface the recovered value as LATEST#.
+        #
+        # Defence: drop an unavailable/unknown transition row when this batch
+        # also carries a numeric value row for the same entity at an equal or
+        # later minute.  The recovered value is the truth; the intra-window
+        # outage blip is stale by emit time.  A genuine outage with no
+        # in-batch recovery keeps its transition row (no competing numeric
+        # row), and non-numeric switch/light transitions are unaffected (their
+        # categories never produce numeric accumulator rows).
+        if self._pending_latest_only_rows:
+            latest_numeric_ts: dict[str, str] = {}
+            for entity_id, rows in rows_by_entity.items():
+                for r in rows:
+                    if isinstance(r.get("state"), (int, float)) and not isinstance(
+                        r.get("state"), bool
+                    ):
+                        ts = r["ts"]
+                        prev = latest_numeric_ts.get(entity_id)
+                        if prev is None or ts > prev:
+                            latest_numeric_ts[entity_id] = ts
+            for row in self._pending_latest_only_rows:
+                if row.get("state") in _UNAVAILABLE_STATES:
+                    recovery_ts = latest_numeric_ts.get(row["entity_id"])
+                    if recovery_ts is not None and recovery_ts >= row["ts"]:
+                        log.debug(
+                            "send-policy: drop stale unavailable transition for "
+                            "%s @ %s — superseded by recovery value row @ %s",
+                            row["entity_id"], row["ts"], recovery_ts,
+                        )
+                        continue
+                out.append(row)
+            self._pending_latest_only_rows = []
+
         return out
 
     # ---------------------- v0.2.2 diagnostic snapshot --------------------

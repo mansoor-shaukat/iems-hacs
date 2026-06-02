@@ -4,7 +4,17 @@ DOMAIN = "iems"
 # Sprint 6 (2026-05-24): per-minute aggregation in HACS — material architecture
 # change (was raw state_changed forwarding).  Bumping to 0.2.0 so support has a
 # clean cut-line between "raw events" and "pre-aggregated minute rows".
-VERSION = "0.2.7"
+# v0.3.0 (2026-05-31): per-category send-policy gating layered on top of
+# per-minute aggregation.  Always / threshold / latest-only / skip-on-unavailable
+# buckets per docs/architecture/send_policy.md.  No wire-shape change; gates
+# WHICH rows enter the batch, not their structure.
+# v0.3.1 (2026-06-01): move `meter.energy` (catch-all for voltage / current /
+# frequency / PF / VA / VAR — fast-moving instantaneous electrical signals)
+# from the threshold bucket to the Always bucket.  Cumulative kWh classifies
+# as `sensor.energy` and stays threshold-gated.  Fixes silent suppression
+# of `sensor.*_grid_l1_voltage` TS# rows that broke downstream grid-outage
+# detection in staging.  See docs/architecture/send_policy.md update.
+VERSION = "0.3.2"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"
@@ -130,3 +140,38 @@ MAX_ENTITIES_PER_BATCH_PUBLISH = 200
 # Set EXACTLY to the broker's documented limit so we never enqueue or
 # retry a payload that we KNOW the broker will reject.
 MQTT_MESSAGE_SIZE_HARD_LIMIT_BYTES = 131072
+
+# ---------------------------------------------------------------------------
+# v0.3.0 send-policy thresholds — CEO-locked 2026-05-31.
+#
+# Per docs/architecture/send_policy.md, slow-moving numeric signals (SoC,
+# temperature, humidity, cumulative energy) only emit a per-minute TS# row
+# when the *finalised* mean diverges from the entity's last-emitted value by
+# at least the per-category threshold below.  Cuts ~40% of write volume off
+# the always-emit-every-minute v0.2.0 baseline (cost model in the spec doc).
+#
+# Threshold values are FINAL pending real-world fleet data.  If a class of
+# entity surfaces a false-negative (gate keeping users blind to a real
+# signal), the fix is a one-line const tune here — not a wire-shape change.
+#
+# The constants live HERE (not inlined in coordinator.py) so tests can
+# import them and so a future tune is one diff, not a hunt across files.
+# ---------------------------------------------------------------------------
+
+# Battery state-of-charge — emit on Δ ≥ 0.1 percentage points of SoC.
+# Mansoor's 20 kWh battery moves ~3-4% per hour at typical discharge; 0.1%
+# is well below the visible-on-chart threshold but above sensor noise.
+SOC_DELTA_THRESHOLD_PCT = 0.1
+
+# Indoor / outdoor temperature — emit on Δ ≥ 0.5°C.  HA climate entities
+# self-report at this precision; smaller deltas are sensor wobble.
+TEMPERATURE_DELTA_THRESHOLD_C = 0.5
+
+# Humidity — emit on Δ ≥ 1%.  Slowest-moving environmental signal in the
+# fleet; 1 percentage point is the chart-visible step.
+HUMIDITY_DELTA_THRESHOLD_PCT = 1.0
+
+# Cumulative energy meters (sensor.energy / meter.energy) — emit on
+# Δ ≥ 1.0 kWh.  Cumulative counters monotonically increase; 1 kWh is the
+# Sprint-7 reporting granularity for energy widgets.
+ENERGY_DELTA_THRESHOLD_KWH = 1.0
