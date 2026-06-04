@@ -14,7 +14,14 @@ DOMAIN = "iems"
 # as `sensor.energy` and stays threshold-gated.  Fixes silent suppression
 # of `sensor.*_grid_l1_voltage` TS# rows that broke downstream grid-outage
 # detection in staging.  See docs/architecture/send_policy.md update.
-VERSION = "0.3.2"
+# v0.4.0 (2026-06-03): shipping-mode FSM (#9, ADR 0005).  The 30s telemetry
+# publish path is now gated on `shipping_mode` (setup/paused suppress, active
+# ships filtered to the whitelist).  Cloud commands transitions over the
+# `iems/{user_id}/command` down-topic (QoS 1, persistent subscribe); HACS
+# reconciles to cloud truth on reconnect via the /hacs/status pull.  No
+# wire-shape change to telemetry; gates WHETHER a batch publishes + WHICH
+# entities it carries.  Enforces "no telemetry until confirmed".
+VERSION = "0.4.0"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"
@@ -82,6 +89,16 @@ CREDENTIAL_REFRESH_LEAD_SECONDS = 300
 IEMS_AUTH_URL = "https://mnrwhhjnuf.execute-api.eu-central-1.amazonaws.com/hacs-auth"
 IEMS_AUTH_HTTP_TIMEOUT_SECONDS = 10
 
+# #9 (ADR 0005) — HACS /hacs/status reconnect-reconcile endpoint.
+# Pulled once on broker resume to recover a shipping-mode command the cloud
+# may have published while HACS was offline + the persistent session expired.
+# Sits on the same API-GW stage as /hacs-auth; authed with the same API key
+# (the only auth mechanism HACS holds — see contract gap note in the #9 PR).
+# CONTRACT GAP: the server-side endpoint + its exact auth contract are not yet
+# locked. The client degrades to None on 404/error so wiring it now is safe.
+IEMS_STATUS_URL = "https://mnrwhhjnuf.execute-api.eu-central-1.amazonaws.com/hacs-status"
+IEMS_STATUS_HTTP_TIMEOUT_SECONDS = 10
+
 # Rate-limit backoff — per spec §7 Q4: 400/401 are permanent fails
 # (no retry); 429 uses 30s→10min exponential; 5xx uses uncapped
 # exponential starting at BACKOFF_INITIAL_SECONDS.
@@ -92,6 +109,50 @@ RATE_LIMIT_BACKOFF_MAX_SECONDS = 600
 # user_id comes from the auth provider, never hardcoded here.
 TELEMETRY_TOPIC_TEMPLATE = "iems/{user_id}/telemetry"
 HEARTBEAT_TOPIC_TEMPLATE = "iems/{user_id}/heartbeat"
+# Onboarding v2 (#4, ADR 0005) — dedicated setup-snapshot up-topic. The ONE
+# payload that flows pre-confirmation; distinct from telemetry. One-off,
+# published on first install + on each take_setup_snapshot command.
+SETUP_TOPIC_TEMPLATE = "iems/{user_id}/setup"
+# Onboarding v2 (#4) — cloud→HACS shipping-mode + snapshot command down-topic.
+COMMAND_TOPIC_TEMPLATE = "iems/{user_id}/command"
+
+# ---------------------------------------------------------------------------
+# Shipping-mode FSM (#9, ADR 0005) — the publish-gate state machine.
+#
+# Three explicit modes govern whether the 30s telemetry batch path publishes:
+#   setup   — first install, before the user confirms anything. Setup snapshot
+#             + heartbeat only. NO telemetry batches. Edge-PoC outage detection
+#             is local-only and still runs (user not unprotected).
+#   paused  — setup snapshot landed, cloud built a draft site_model, awaiting
+#             the user's wizard confirmation. Same gating as setup.
+#   active  — user confirmed the site_model. 30s telemetry batches publish,
+#             filtered to the whitelisted entities only (non-whitelisted
+#             entities never leave HA — the privacy posture in ADR 0005).
+#
+# Cloud is authoritative: it commands the transitions via MQTT on the command
+# down-topic. HACS reconciles to the cloud's truth on reconnect via the
+# /hacs/status pull. The default-on-fresh-install mode is `setup`.
+# ---------------------------------------------------------------------------
+SHIPPING_MODE_SETUP = "setup"
+SHIPPING_MODE_PAUSED = "paused"
+SHIPPING_MODE_ACTIVE = "active"
+
+# Valid shipping modes — the command handler rejects anything outside this set.
+VALID_SHIPPING_MODES = frozenset(
+    {SHIPPING_MODE_SETUP, SHIPPING_MODE_PAUSED, SHIPPING_MODE_ACTIVE}
+)
+
+# Modes in which the 30s telemetry batch path is SUPPRESSED. `active` is the
+# only mode that ships telemetry; everything else is snapshot + heartbeat only.
+TELEMETRY_SUPPRESSED_MODES = frozenset({SHIPPING_MODE_SETUP, SHIPPING_MODE_PAUSED})
+
+# Default shipping mode on a fresh install — first install starts in `setup`
+# so no telemetry flows until the cloud commands `active` post-confirmation.
+DEFAULT_SHIPPING_MODE = SHIPPING_MODE_SETUP
+
+# Command actions on the down-topic (contracts/mqtt_topics.md §command).
+COMMAND_ACTION_SET_SHIPPING_MODE = "set_shipping_mode"
+COMMAND_ACTION_TAKE_SETUP_SNAPSHOT = "take_setup_snapshot"
 
 # Schema — MUST match server-side ingestion validator version
 SCHEMA_VERSION = "0.6.0"

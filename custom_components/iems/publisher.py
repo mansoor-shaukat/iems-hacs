@@ -19,6 +19,7 @@ from .const import (
     BACKOFF_MAX_SECONDS,
     HEARTBEAT_TOPIC_TEMPLATE,
     MAX_QUEUE_DEPTH,
+    SETUP_TOPIC_TEMPLATE,
     TELEMETRY_TOPIC_TEMPLATE,
 )
 
@@ -143,6 +144,23 @@ class TelemetryPublisher:
         """Heartbeat — QoS 0, fire-and-forget, never enqueued."""
         topic = HEARTBEAT_TOPIC_TEMPLATE.format(user_id=self._user_id)
         return await self._safe_publish(topic=topic, payload=payload, qos=0)
+
+    async def publish_setup_snapshot(self, payload: dict) -> bool:
+        """Setup snapshot (#4, ADR 0005) — QoS 1 on the dedicated setup topic.
+
+        The ONE payload that flows pre-confirmation. Published once on first
+        install and once per `take_setup_snapshot` command — NOT a recurring
+        stream. Returns True on success, False on a (caught) publish failure.
+
+        Deliberately NOT enqueued on failure: the telemetry retry queue
+        (`self._queue`) drains onto the TELEMETRY topic, so a queued snapshot
+        would leak the wrong payload onto the wrong topic. A failed snapshot is
+        re-driven by the caller (first-install retry on next setup, or a fresh
+        take_setup_snapshot command). It is also NOT counted in `batches_sent`
+        — that counter tracks telemetry batches only.
+        """
+        topic = SETUP_TOPIC_TEMPLATE.format(user_id=self._user_id)
+        return await self._safe_publish(topic=topic, payload=payload, qos=1)
 
     # ------------------------------ Drain ------------------------------------
 

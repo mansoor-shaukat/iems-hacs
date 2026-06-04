@@ -122,6 +122,12 @@ class IotCorePublisher:
         self._connection: Any | None = None  # awsiot.MqttClientConnection
         self._connected = False
         self._connect_lock = asyncio.Lock()
+        # #9 (ADR 0005) — optional async hook fired on every broker resume
+        # (reconnect).  Set by __init__.py to run the reconnect safety net:
+        # resubscribe to the command topic + pull /hacs/status to reconcile
+        # the shipping mode to the cloud's truth.  Signature: `async () -> None`.
+        # None = no hook (publish-only deployments).
+        self._on_resume = None
         # Captured at connect() time; reused by awscrt threadpool callbacks
         # to post state changes back to HA's asyncio loop via call_soon_threadsafe.
         self._event_loop: asyncio.AbstractEventLoop | None = None
@@ -140,6 +146,20 @@ class IotCorePublisher:
         # `_on_interrupted` for the classification tokens.
         self._client_error_disconnects: int = 0
         self._last_disconnect_reason: str | None = None
+        # #9 (ADR 0005) — command down-topic subscriptions.  topic -> {qos,
+        # message_handler}.  Stored so they can be replayed on reconnect
+        # (resubscribe_all): clean_session=False means the broker SHOULD
+        # restore subscriptions, but if the session expired (>1h offline) the
+        # subscription is gone, so we re-issue defensively on every resume.
+        self._subscriptions: dict[str, dict[str, Any]] = {}
+        # Strong references to fire-and-forget tasks scheduled from awscrt
+        # threadpool callbacks (command dispatch + on-resume hook).  CPython's
+        # loop.create_task keeps only a WEAK reference, so without retaining
+        # the Task here the GC can collect + cancel it mid-flight before the
+        # coroutine completes — the exact v0.1.14 P0 failure mode.  Each task
+        # add_done_callback(discard)s itself when it finishes so the set never
+        # grows unbounded.
+        self._bg_tasks: set[asyncio.Task] = set()
 
     @property
     def last_publish_payload_bytes(self) -> int:
@@ -345,6 +365,119 @@ class IotCorePublisher:
             raise last_exc
         return False
 
+    async def subscribe(self, *, topic: str, qos: int, message_handler) -> None:
+        """Subscribe to an MQTT topic, routing messages to `message_handler`.
+
+        #9 (ADR 0005): HACS subscribes to `iems/{user_id}/command` (QoS 1) so
+        the cloud can push shipping-mode + snapshot commands.
+
+        `message_handler` is an async callable `(payload: bytes) -> Any`.  It is
+        invoked from the awscrt threadpool callback via
+        `loop.call_soon_threadsafe` + `asyncio.create_task` so it runs on the
+        HA event loop, never on the awscrt thread.  Exceptions inside the
+        handler are swallowed by the handler itself (see CommandHandler.
+        on_message) — but we also guard here so a handler that forgets can't
+        kill the callback.
+
+        The subscription is recorded in `self._subscriptions` so it can be
+        replayed on reconnect via `resubscribe_all`.
+
+        Args:
+            topic: Full MQTT topic string (e.g. iems/{user_id}/command).
+            qos:   0 or 1.
+            message_handler: async (payload: bytes) -> Any.
+        """
+        if not self._connected or self._connection is None:
+            log.info("iot_core: connection dropped, reconnecting before subscribe")
+            await self.connect()
+
+        # Record first so a reconnect that races the subscribe still replays it.
+        self._subscriptions[topic] = {"qos": qos, "message_handler": message_handler}
+        await self._issue_subscribe(topic=topic, qos=qos, message_handler=message_handler)
+        log.info("iot_core: subscribed topic=%s qos=%d", topic, qos)
+
+    async def _issue_subscribe(self, *, topic: str, qos: int, message_handler) -> None:
+        """Issue a single awscrt subscribe + await the broker SUBACK."""
+        qos_enum = self._qos_enum(qos)
+
+        def _on_message(topic, payload, dup, qos, retain, **_kwargs) -> None:
+            """awscrt message callback — fires on the awscrt threadpool thread.
+
+            Schedules the async handler on the HA event loop.  Never blocks the
+            awscrt thread, never raises out of it.
+            """
+            loop = self._event_loop
+            if loop is None or not loop.is_running():
+                log.warning(
+                    "iot_core: dropping command on %s — no running event loop",
+                    topic,
+                )
+                return
+
+            def _schedule() -> None:
+                try:
+                    # Retain a strong ref so the GC can't collect the task
+                    # mid-flight (v0.1.14 P0); discard it on completion.
+                    task = loop.create_task(
+                        self._run_message_handler(message_handler, payload)
+                    )
+                    self._bg_tasks.add(task)
+                    task.add_done_callback(self._bg_tasks.discard)
+                except RuntimeError as exc:  # pragma: no cover — loop teardown race
+                    log.warning("iot_core: could not schedule command handler: %s", exc)
+
+            loop.call_soon_threadsafe(_schedule)
+
+        sub_future, _ = self._connection.subscribe(
+            topic=topic,
+            qos=qos_enum,
+            callback=_on_message,
+        )
+        loop = asyncio.get_event_loop()
+        await asyncio.wait_for(
+            loop.run_in_executor(None, sub_future.result),
+            timeout=MQTT_CONNECT_TIMEOUT_SECONDS,
+        )
+
+    @staticmethod
+    async def _run_message_handler(message_handler, payload) -> None:
+        """Await the injected handler, swallowing any error it lets escape."""
+        try:
+            await message_handler(payload)
+        except Exception as exc:  # noqa: BLE001 — callback path must survive
+            log.error(
+                "iot_core: command handler raised %s: %s",
+                type(exc).__name__, exc,
+            )
+
+    async def resubscribe_all(self) -> None:
+        """Re-issue every recorded subscription against the current connection.
+
+        Called after a reconnect.  clean_session=False means the broker should
+        restore subscriptions on a resumed session, but if the persistent
+        session expired (>1h offline) they're gone — so we replay defensively.
+        Failures are logged, not raised: a resubscribe miss must not crash the
+        reconnect path (the next reconnect retries).
+        """
+        if not self._subscriptions:
+            return
+        if not self._connected or self._connection is None:
+            log.info("iot_core: reconnecting before resubscribe")
+            await self.connect()
+        for topic, sub in list(self._subscriptions.items()):
+            try:
+                await self._issue_subscribe(
+                    topic=topic,
+                    qos=sub["qos"],
+                    message_handler=sub["message_handler"],
+                )
+                log.info("iot_core: resubscribed topic=%s", topic)
+            except (OSError, TimeoutError, asyncio.TimeoutError) as exc:
+                log.warning(
+                    "iot_core: resubscribe failed topic=%s: %s: %s",
+                    topic, type(exc).__name__, exc,
+                )
+
     async def _publish_once(self, *, topic: str, payload_bytes: bytes, qos_enum) -> None:
         """Single attempt at a publish — issues the awscrt future and awaits ACK.
 
@@ -450,6 +583,13 @@ class IotCorePublisher:
             loop = self._event_loop
             if loop is not None and loop.is_running():
                 loop.call_soon_threadsafe(self._mark_connected)
+                # #9 — fire the reconnect safety net (resubscribe + /hacs/status
+                # reconcile) on the HA loop.  Scheduled, never run on the awscrt
+                # thread.  session_present=False means the broker dropped our
+                # session (>1h offline) so subscriptions + any queued command
+                # are gone — exactly when the reconcile pull matters most.
+                if self._on_resume is not None:
+                    loop.call_soon_threadsafe(self._schedule_on_resume)
 
         # v0.2.5 (2026-05-26) — clean_session=False enables AWS IoT Core
         # MQTT 3.1.1 persistent sessions.  The broker queues QoS 1 publishes
@@ -524,6 +664,35 @@ class IotCorePublisher:
     def _mark_connected(self) -> None:
         """Flip internal state to connected. Called on HA loop only."""
         self._connected = True
+
+    def set_on_resume(self, hook) -> None:
+        """Register the async reconnect-safety-net hook (#9). `async () -> None`."""
+        self._on_resume = hook
+
+    def _schedule_on_resume(self) -> None:
+        """Schedule the on_resume hook on the HA loop. Called on HA loop only."""
+        hook = self._on_resume
+        if hook is None:
+            return
+        loop = self._event_loop
+        if loop is None or not loop.is_running():
+            return
+        # Retain a strong ref so the GC can't collect the task mid-flight
+        # (v0.1.14 P0); discard it on completion.
+        task = loop.create_task(self._run_on_resume(hook))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    @staticmethod
+    async def _run_on_resume(hook) -> None:
+        """Await the resume hook, swallowing errors so a reconnect can't crash."""
+        try:
+            await hook()
+        except Exception as exc:  # noqa: BLE001 — reconnect path must survive
+            log.error(
+                "iot_core: on_resume hook raised %s: %s",
+                type(exc).__name__, exc,
+            )
 
     @staticmethod
     def _qos_enum(qos: int):

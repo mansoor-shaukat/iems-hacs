@@ -56,9 +56,13 @@ try:
 except ImportError:  # pragma: no cover - dev env
     _HA_AVAILABLE = False
 
+from .command_handler import CommandHandler
+from .const import COMMAND_TOPIC_TEMPLATE
 from .coordinator import IemsCoordinator
 from .edge_poc_outage import EdgePocOutageHandler, register_services, resolve_db_path
 from .publisher import TelemetryPublisher
+from .snapshot import SetupSnapshotManager, collect_setup_snapshot
+from .status_client import HacsStatusClient
 
 
 def _consumer_device_ids(er_reg, entities) -> frozenset:
@@ -199,6 +203,103 @@ if _HA_AVAILABLE:
 
         await coordinator.start()
 
+        # Onboarding v2 (#4, ADR 0005) — setup snapshot.
+        # The snapshot is the ONE payload that flows pre-confirmation. We
+        # publish it once on first install (and once per take_setup_snapshot
+        # command) on the dedicated `iems/{user_id}/setup` topic. It is NOT a
+        # telemetry batch — no 30s stream side effect.
+        #
+        # NOTE: shipping-mode gating of the 30s telemetry path (setup/paused →
+        # no telemetry batches) is a separate slice the CTO sequences after
+        # this one; this dispatch only wires the snapshot publish path.
+        def _collect(source_kind: str):
+            # Returns a coroutine; SetupSnapshotManager awaits awaitable
+            # collectors (see _collect_snapshot).
+            return collect_setup_snapshot(
+                hass, user_id=creds.identity_id, source_kind=source_kind,
+            )
+
+        snapshot_manager = SetupSnapshotManager(
+            publisher=publisher,
+            collect=_collect,
+        )
+        # Fire the first-install snapshot. Failure is non-fatal — the manager
+        # logs + leaves the one-off guard unset so a later setup retry re-fires.
+        try:
+            await snapshot_manager.publish_on_first_install()
+        except (OSError, TimeoutError, ValueError) as exc:
+            log.warning(
+                "iems: first-install setup snapshot failed (non-fatal): %s: %s",
+                type(exc).__name__, exc,
+            )
+
+        # Onboarding v2 (#9, ADR 0005) — shipping-mode command channel.
+        # Subscribe to the cloud→HACS command down-topic (QoS 1, persistent
+        # session) so the cloud can flip shipping_mode + reconcile the
+        # whitelist + trigger a rescan snapshot.  The coordinator's flush()
+        # gates the 30s telemetry path on shipping_mode; first install starts
+        # in `setup` so NO telemetry flows until the cloud commands `active`
+        # after the user confirms the site_model in the wizard.
+        command_handler = CommandHandler(
+            coordinator=coordinator,
+            snapshot_manager=snapshot_manager,
+        )
+        status_client = HacsStatusClient(api_key=api_key)
+        command_topic = COMMAND_TOPIC_TEMPLATE.format(user_id=creds.identity_id)
+
+        async def _reconcile_on_resume() -> None:
+            """Reconnect safety net (#9): resubscribe + pull /hacs/status.
+
+            Fired on every broker resume.  Re-issues the command-topic
+            subscription (the persistent session may have expired while
+            offline) and pulls /hacs/status once to reconcile the local
+            shipping_mode to the cloud's truth — covers the case where the
+            cloud commanded a transition while HACS was offline and the
+            queued MQTT command was dropped by session expiry.
+            """
+            try:
+                await adapter.resubscribe_all()
+            except (OSError, TimeoutError) as exc:
+                log.warning(
+                    "iems: resubscribe-on-resume failed: %s: %s",
+                    type(exc).__name__, exc,
+                )
+            status = await status_client.fetch_status()
+            if status is not None:
+                coordinator.reconcile_from_status(status)
+
+        adapter.set_on_resume(_reconcile_on_resume)
+
+        # Initial subscribe.  Non-fatal on failure — the resume hook re-issues
+        # it on the next reconnect, and telemetry gating defaults safe (`setup`
+        # = no telemetry) so a missed command can't leak data.
+        try:
+            await adapter.subscribe(
+                topic=command_topic,
+                qos=1,
+                message_handler=command_handler.on_message,
+            )
+        except (OSError, TimeoutError) as exc:
+            log.warning(
+                "iems: command-topic subscribe failed (will retry on resume): "
+                "%s: %s",
+                type(exc).__name__, exc,
+            )
+
+        # Initial reconcile — pull /hacs/status once at startup so a HACS
+        # restart (config-entry reload) adopts the cloud's current mode rather
+        # than resetting to the `setup` default.  Non-fatal; degrades to the
+        # default mode if the endpoint is unavailable.
+        try:
+            startup_status = await status_client.fetch_status()
+            if startup_status is not None:
+                coordinator.reconcile_from_status(startup_status)
+        except (OSError, TimeoutError) as exc:
+            log.warning(
+                "iems: startup /hacs/status pull failed (non-fatal): %s: %s",
+                type(exc).__name__, exc,
+            )
+
         # Sprint 5 Track B — Edge PoC: outage signal → light.living_lamp blue.
         # CEO directive 2026-05-01: blue (was amber Day 1-4).
         # Local-only (no cloud round-trip). Single-site PoC (Mansoor's home).
@@ -215,6 +316,12 @@ if _HA_AVAILABLE:
             "publisher": publisher,
             "auth": auth,
             "edge_poc": edge_poc,
+            # Onboarding v2 (#4) — kept so the take_setup_snapshot command
+            # handler can re-publish a rescan snapshot.
+            "snapshot_manager": snapshot_manager,
+            # Onboarding v2 (#9) — shipping-mode command channel.
+            "command_handler": command_handler,
+            "status_client": status_client,
         }
         return True
 

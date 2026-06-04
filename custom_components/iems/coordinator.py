@@ -60,12 +60,15 @@ from typing import Any
 from .classifier import classify
 from .const import (
     BATCH_WINDOW_SECONDS,
+    DEFAULT_SHIPPING_MODE,
     ENERGY_DELTA_THRESHOLD_KWH,
     HEARTBEAT_INTERVAL_SECONDS,
     HUMIDITY_DELTA_THRESHOLD_PCT,
     MAX_ENTITIES_PER_BATCH_PUBLISH,
     SOC_DELTA_THRESHOLD_PCT,
+    TELEMETRY_SUPPRESSED_MODES,
     TEMPERATURE_DELTA_THRESHOLD_C,
+    VALID_SHIPPING_MODES,
 )
 from .mtronic_dispatch import DispatchCapture
 from .telemetry import EmptyBatchError, build_batch, build_heartbeat
@@ -343,6 +346,25 @@ class IemsCoordinator:
         # accidental ref doesn't AttributeError.  Tests should use the
         # accumulators / finalisation surface instead.
         self.pending: list[dict] = []
+
+        # ---- Shipping-mode FSM (#9, ADR 0005) ---------------------------
+        # The publish gate. `setup`/`paused` suppress the 30s telemetry batch
+        # path; `active` ships it, filtered to `_whitelist` when one is set.
+        # Cloud is authoritative — it commands transitions over the MQTT
+        # command down-topic; HACS reconciles to cloud truth on reconnect via
+        # the /hacs/status pull.  Capture + accumulation + edge-PoC keep
+        # running in every mode; only the PUBLISH is gated, so a confirmed user
+        # ships the freshest sealed minutes with no warm-up gap.
+        self.shipping_mode: str = DEFAULT_SHIPPING_MODE
+        # Entity whitelist for active-mode publishing.  `None` means "no
+        # whitelist commanded" → ship everything (legacy pre-gate behaviour,
+        # matches api.yaml's treatment of seeded-confirmed site_models).  A
+        # non-None frozenset filters every batch so non-whitelisted entities
+        # never leave HA (the ADR 0005 privacy posture).
+        self._whitelist: frozenset[str] | None = None
+        # Monotonic version of the whitelist the cloud last sent.  Used to
+        # ignore out-of-order command/status updates (a lower version is stale).
+        self._whitelist_version: int = -1
 
         self._unsub_state = None
         self._batch_task: asyncio.Task | None = None
@@ -805,6 +827,131 @@ class IemsCoordinator:
                 pending += 1
         return (len(live_entities), total_samples, pending)
 
+    # ---------------------- Shipping-mode FSM (#9) ------------------------
+
+    @property
+    def whitelist(self) -> frozenset[str] | None:
+        """The active-mode entity whitelist, or None when none is commanded."""
+        return self._whitelist
+
+    @property
+    def whitelist_version(self) -> int:
+        """Monotonic version of the last whitelist the cloud sent (-1 = never)."""
+        return self._whitelist_version
+
+    def set_shipping_mode(
+        self,
+        mode: str,
+        *,
+        whitelist: list[str] | None = None,
+        whitelist_version: int | None = None,
+    ) -> None:
+        """Transition the shipping mode and optionally reconcile the whitelist.
+
+        Called from the command handler on a `set_shipping_mode` MQTT message.
+
+        Parameters
+        ----------
+        mode
+            One of VALID_SHIPPING_MODES.  An unknown mode raises ValueError and
+            leaves the current mode UNTOUCHED — a malformed cloud command must
+            never silently flip us into an undefined gate state.
+        whitelist
+            Optional entity-id list.  When present, reconciles the whitelist
+            (subject to the version check).  When ABSENT, the existing whitelist
+            is preserved — the cloud may re-send a mode without re-sending an
+            unchanged whitelist.
+        whitelist_version
+            Monotonic version stamp for the whitelist.  A version <= the current
+            one is treated as stale and ignored (out-of-order delivery guard).
+
+        Raises
+        ------
+        ValueError
+            On an unknown mode.
+        """
+        if mode not in VALID_SHIPPING_MODES:
+            raise ValueError(
+                f"unknown shipping_mode {mode!r}; "
+                f"expected one of {sorted(VALID_SHIPPING_MODES)}"
+            )
+        prev = self.shipping_mode
+        self.shipping_mode = mode
+        if whitelist is not None:
+            self.set_whitelist(whitelist, whitelist_version=whitelist_version)
+        if prev != mode:
+            log.info("shipping_mode transition: %s -> %s", prev, mode)
+
+    def set_whitelist(
+        self, whitelist: list[str], *, whitelist_version: int | None = None
+    ) -> None:
+        """Reconcile the active-mode whitelist.
+
+        An update whose `whitelist_version` is <= the currently-held version is
+        ignored as stale (commands and status pulls can race / arrive out of
+        order).  A None version is always applied (callers that don't track a
+        version — e.g. tests — opt out of the staleness guard).
+        """
+        if (
+            whitelist_version is not None
+            and whitelist_version <= self._whitelist_version
+        ):
+            log.debug(
+                "ignoring stale whitelist v%s (current v%s)",
+                whitelist_version, self._whitelist_version,
+            )
+            return
+        self._whitelist = frozenset(whitelist)
+        if whitelist_version is not None:
+            self._whitelist_version = whitelist_version
+        log.info(
+            "whitelist reconciled: %d entities (v%s)",
+            len(self._whitelist), whitelist_version,
+        )
+
+    def reconcile_from_status(self, status: dict[str, Any]) -> None:
+        """Reconcile local FSM state to the cloud's truth from a /hacs/status pull.
+
+        The reconnect safety net (ADR 0005 / issue #9): the cloud may have
+        published a command while HACS was offline AND the broker's persistent
+        session expired (>1h offline), dropping the queued command.  On
+        reconnect HACS pulls /hacs/status once and adopts the cloud-declared
+        mode + whitelist unconditionally — the cloud is authoritative.
+
+        Malformed / missing fields are ignored so a bad status response can't
+        corrupt local state (fail safe to whatever we already had).
+        """
+        mode = status.get("shipping_mode")
+        if mode in VALID_SHIPPING_MODES:
+            if mode != self.shipping_mode:
+                log.info(
+                    "reconcile: cloud shipping_mode=%s overrides local=%s",
+                    mode, self.shipping_mode,
+                )
+            self.shipping_mode = mode
+        elif mode is not None:
+            log.warning("reconcile: ignoring invalid shipping_mode %r", mode)
+        whitelist = status.get("whitelist")
+        if isinstance(whitelist, list):
+            self.set_whitelist(
+                whitelist, whitelist_version=status.get("whitelist_version")
+            )
+
+    def _telemetry_publishing_enabled(self) -> bool:
+        """True iff the current shipping mode permits 30s telemetry batches."""
+        return self.shipping_mode not in TELEMETRY_SUPPRESSED_MODES
+
+    def _filter_to_whitelist(self, rows: list[dict]) -> list[dict]:
+        """Drop rows for entities not on the whitelist.
+
+        No whitelist commanded (None) → pass everything through (legacy
+        pre-gate behaviour).  Otherwise only whitelisted entity rows survive;
+        non-whitelisted entities never leave HA (ADR 0005 privacy posture).
+        """
+        if self._whitelist is None:
+            return rows
+        return [r for r in rows if r.get("entity_id") in self._whitelist]
+
     # ---------------------- Flush + publish -------------------------------
 
     async def flush(self) -> None:
@@ -840,6 +987,28 @@ class IemsCoordinator:
         )
 
         rows = self._drain_finalised_rows()
+
+        # ---- Shipping-mode gate (#9, ADR 0005) --------------------------
+        # setup / paused suppress the 30s telemetry batch path entirely:
+        # NO telemetry batches leave HA before the user confirms.  We still
+        # DRAIN the accumulators above (sealing minutes, advancing the
+        # late-arrival high-water marks, keeping memory bounded) — we just
+        # don't build or publish a batch.  Capture + edge-PoC keep running,
+        # so the user is not unprotected during onboarding.  Heartbeat is on
+        # a separate path and is unaffected.
+        if not self._telemetry_publishing_enabled():
+            if rows:
+                log.debug(
+                    "shipping_mode=%s: suppressing %d telemetry rows "
+                    "(no batch published)",
+                    self.shipping_mode, len(rows),
+                )
+            self._last_flush_row_count = 0
+            return
+
+        # active mode: filter to the whitelist so non-whitelisted entities
+        # never leave HA (ADR 0005 privacy posture).  None whitelist → all.
+        rows = self._filter_to_whitelist(rows)
         self._last_flush_row_count = len(rows)
         if not rows:
             return
