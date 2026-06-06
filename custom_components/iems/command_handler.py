@@ -159,6 +159,21 @@ class CommandHandler:
         await self._recovery_manager.recover_window(
             window_id=window_id, start_ts=start_ts, end_ts=end_ts
         )
+        # v0.4.7: fire an IMMEDIATE heartbeat so the `last_recovery` ack reaches
+        # the cloud in seconds, not up to HEARTBEAT_INTERVAL_SECONDS (5 min)
+        # later on the next scheduled tick. The recover result the user is
+        # watching for rides the heartbeat; the 5-min cadence made the portal's
+        # "Checking…" feel stuck. Best-effort — a heartbeat failure here must
+        # never break the command callback invariant (logged + swallowed).
+        hb = getattr(self._coordinator, "heartbeat_once", None)
+        if callable(hb):
+            try:
+                await hb()
+            except Exception as exc:  # noqa: BLE001 — never break the callback
+                log.warning(
+                    "recover_window: immediate heartbeat failed: %s: %s",
+                    type(exc).__name__, exc,
+                )
 
     async def on_message(self, raw: bytes | str | dict) -> bool:
         """awscrt-callback-facing entry point: decode + dispatch, never raises.

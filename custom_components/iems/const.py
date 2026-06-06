@@ -99,7 +99,7 @@ DOMAIN = "iems"
 # accumulators, the 300s flush cadence, or the 0.4.5 cold-start fast-flush.
 # Heartbeat schema_version unchanged (last_recovery is additive + nullable);
 # telemetry wire-shape / chunk cap (200) / FSM all UNCHANGED.
-VERSION = "0.4.6"
+VERSION = "0.4.7"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"
