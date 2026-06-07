@@ -99,7 +99,27 @@ DOMAIN = "iems"
 # accumulators, the 300s flush cadence, or the 0.4.5 cold-start fast-flush.
 # Heartbeat schema_version unchanged (last_recovery is additive + nullable);
 # telemetry wire-shape / chunk cap (200) / FSM all UNCHANGED.
-VERSION = "0.4.7"
+# v0.4.8 (2026-06-07): RECOVER FALSE-SUCCESS FIX (Sprint 7,
+# docs/followups/recover_false_success_2026-06-07.md). v0.4.6's recover_window
+# queried the recorder with include_start_time_state=True across all ~146
+# surfacing entities; when HA had NOTHING inside the window it STILL returned one
+# carried-forward start-of-window State per entity (last_changed BEFORE start),
+# and the capture loop counted every such boundary row toward rows_found +
+# published it. Combined with result=recovered firing on rows_published>0, an
+# unrecoverable gap (HA recorder genuinely empty for the window) reported
+# "recovered, 4639 rows" off a single boundary row — same counter-is-not-evidence
+# family as the 2026-05-27 telemetry incident (verified on CEO's prod home
+# 066de039-2251, Jun-5 gap). Fix is in how rows are COUNTED/CAPTURED, NOT the
+# query flags (include_start_time_state stays True — still useful for the
+# boundary value): a recorder row counts as GENUINE in-window only when
+# start_dt <= last_changed < end_dt (datetime compare, not the ISO string).
+# Carried-forward boundary states (last_changed < start_dt) and end-boundary
+# rows are excluded from BOTH rows_found and the published set. With no genuine
+# in-window rows the result is now no_data (cloud maps no_data -> no_data_in_ha
+# -> "Data unrecoverable"); a static-entity boundary state can never force
+# "recovered". Recovery still runs OFF the steady-state path. No wire-shape /
+# payload-composition / chunk-cap (200) / FSM / SCHEMA_VERSION change.
+VERSION = "0.4.8"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"

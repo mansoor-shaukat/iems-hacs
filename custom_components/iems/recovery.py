@@ -232,21 +232,37 @@ async def _query_recorder(
     return await instance.async_add_executor_job(bound)
 
 
-def _row_ts_iso(state_obj: Any) -> str | None:
-    """Extract an ISO-Z timestamp from a recorder State (or dict) row."""
+def _row_last_changed_dt(state_obj: Any) -> datetime | None:
+    """Extract a timezone-aware UTC `datetime` from a recorder State (or dict) row.
+
+    Returns the row's `last_changed` as an aware UTC `datetime`, or None if it
+    can't be parsed.  This is the basis for the GENUINE-in-window filter in
+    `recover_window`: a row whose `last_changed` is BEFORE the window start is a
+    carried-forward `include_start_time_state` boundary value (HA's last-known
+    state as the gap opened), NOT real in-window history.  We compare the parsed
+    datetime — never the ISO string — so the boundary test is exact.
+    """
     last_changed = getattr(state_obj, "last_changed", None)
     if last_changed is None and isinstance(state_obj, dict):
         last_changed = state_obj.get("last_changed")
     if isinstance(last_changed, datetime):
-        return _dt_to_iso_z(last_changed)
+        if last_changed.tzinfo is None:
+            last_changed = last_changed.replace(tzinfo=timezone.utc)
+        return last_changed.astimezone(timezone.utc)
     if isinstance(last_changed, (int, float)):
-        return _dt_to_iso_z(datetime.fromtimestamp(last_changed, tz=timezone.utc))
+        return datetime.fromtimestamp(last_changed, tz=timezone.utc)
     if isinstance(last_changed, str):
         try:
-            return _dt_to_iso_z(_parse_iso_utc(last_changed))
+            return _parse_iso_utc(last_changed)
         except (ValueError, TypeError):
             return None
     return None
+
+
+def _row_ts_iso(state_obj: Any) -> str | None:
+    """Extract an ISO-Z timestamp from a recorder State (or dict) row."""
+    dt = _row_last_changed_dt(state_obj)
+    return _dt_to_iso_z(dt) if dt is not None else None
 
 
 def _row_state(state_obj: Any) -> Any:
@@ -371,15 +387,34 @@ class RecoveryManager:
             )
 
         # --- Classify + capture the found rows ------------------------------
+        # CRITICAL (recover_false_success_2026-06-07): the recorder query uses
+        # include_start_time_state=True, so for a window where HA has NOTHING
+        # inside [start_dt, end_dt) it STILL returns one carried-forward
+        # start-of-window State per entity (its last_changed is BEFORE start_dt).
+        # Those synthetic boundary states are NOT genuine in-window history — if
+        # we counted them toward rows_found or published them, an unrecoverable
+        # gap would falsely score thousands "found" and flip the card to
+        # "recovered" off a single boundary row.  So: a row counts as GENUINE
+        # only when start_dt <= last_changed < end_dt (datetime compare, not the
+        # ISO string).  Boundary states (last_changed < start_dt) are excluded
+        # from rows_found AND from the captured/published set.
         captured: list[dict] = []
-        rows_found = 0
+        rows_found = 0  # GENUINE in-window rows only (excludes boundary states)
+        boundary_skipped = 0  # carried-forward include_start_time_state rows
         for entity_id, state_list in (history or {}).items():
             meta = self._entity_index.get(entity_id) or {}
             for state_obj in state_list or []:
                 raw_state = _row_state(state_obj)
-                ts_iso = _row_ts_iso(state_obj)
-                if raw_state is None or ts_iso is None:
+                last_changed = _row_last_changed_dt(state_obj)
+                if raw_state is None or last_changed is None:
                     continue
+                # Exclude the synthetic include_start_time_state boundary value
+                # (and anything outside the window) — only true interior history
+                # proves the gap is recoverable.
+                if not (start_dt <= last_changed < end_dt):
+                    boundary_skipped += 1
+                    continue
+                ts_iso = _dt_to_iso_z(last_changed)
                 rows_found += 1
                 item = _classify_and_capture(
                     entity_id=entity_id,
@@ -391,15 +426,22 @@ class RecoveryManager:
                     captured.append(item)
 
         if rows_found == 0:
-            # Genuine "HA had nothing for the window" — the truth the cloud
-            # could never learn from duration alone.
+            # No GENUINE in-window rows — HA had nothing for the window itself
+            # (boundary_skipped carried-forward states don't count).  This is the
+            # honest "Data unrecoverable" truth the cloud maps to no_data_in_ha.
+            log.info(
+                "recover_window %s: NO_DATA — 0 genuine in-window rows "
+                "(%d carried-forward boundary states excluded)",
+                window_id, boundary_skipped,
+            )
             return self._finish(
                 window_id=window_id, start_ts=start_ts, end_ts=end_ts,
                 result=RESULT_NO_DATA, rows_found=0, rows_published=0,
             )
         if not captured:
-            # HA had rows but every one was a suppressed sentinel / non-surfacing
-            # — still "no usable data" from the product's point of view.
+            # HA had genuine in-window rows but every one was a suppressed
+            # sentinel (unavailable/unknown) / non-surfacing — still "no usable
+            # data" from the product's point of view.
             return self._finish(
                 window_id=window_id, start_ts=start_ts, end_ts=end_ts,
                 result=RESULT_NO_DATA, rows_found=rows_found, rows_published=0,
@@ -454,6 +496,18 @@ class RecoveryManager:
                     window_id, len(chunk),
                 )
 
+        # Result rule (recover_false_success_2026-06-07) — by this point
+        # `captured`/`rows_published` contain ONLY genuine in-window rows; the
+        # carried-forward boundary states were already excluded above, so a
+        # static-entity boundary value can never force "recovered":
+        #   - rows_published == 0 + failures  -> error    (genuine rows existed
+        #                                                   but publish failed)
+        #   - rows_published == 0, no failures -> no_data  (nothing usable to
+        #                                                   publish)
+        #   - some published, some failed/enqueued -> partial (coverage is
+        #                                                   incomplete — don't
+        #                                                   claim the gap filled)
+        #   - all genuine rows published cleanly    -> recovered
         if rows_published == 0:
             result = RESULT_ERROR if publish_failures else RESULT_NO_DATA
         elif publish_failures:
