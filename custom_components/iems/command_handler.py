@@ -16,6 +16,18 @@ subscribe callback and the coordinator/snapshot FSM:
         -> recovery_manager.recover_window(window_id=..., start_ts=...,
                                            end_ts=...)              (any mode)
 
+    {"action": "rename_device", "device_id": "<ha_device_id>",
+     "name_by_user": "<new name>"}
+        -> device_registry.async_update_device(device_id,
+                                               name_by_user=name)  (any mode)
+
+`rename_device` (contracts/mqtt_topics.md v0.4.0) is the FIRST iEMS write INTO
+HA.  HACS runs inside HA, so it applies the label change in-process via the
+device-registry helper — no external WS round-trip.  It is label-only and
+reversible: it changes the user-visible device name (`name_by_user`) and NEVER
+touches entity_ids.  Requires `hass` to be wired into the handler; when it
+isn't, the command logs + drops as un-dispatchable (callback never crashes).
+
 Design — pure decode + thin dispatch
 ------------------------------------
 `decode_command` is a pure bytes/str → dict parser (raises InvalidCommandError
@@ -34,6 +46,7 @@ from typing import Any
 
 from .const import (
     COMMAND_ACTION_RECOVER_WINDOW,
+    COMMAND_ACTION_RENAME_DEVICE,
     COMMAND_ACTION_SET_SHIPPING_MODE,
     COMMAND_ACTION_TAKE_SETUP_SNAPSHOT,
 )
@@ -82,12 +95,24 @@ class CommandHandler:
         `async recover_window(*, window_id, start_ts, end_ts)`.  None when the
         recovery feature isn't wired (a `recover_window` command then logs +
         drops as un-dispatchable, never crashing the callback).
+      - `hass` — optional HomeAssistant instance.  Needed only by
+        `rename_device` (the in-process device-registry write).  None when the
+        handler isn't wired with HA (a `rename_device` command then logs +
+        drops as un-dispatchable, never crashing the callback).
     """
 
-    def __init__(self, *, coordinator, snapshot_manager, recovery_manager=None) -> None:
+    def __init__(
+        self,
+        *,
+        coordinator,
+        snapshot_manager,
+        recovery_manager=None,
+        hass=None,
+    ) -> None:
         self._coordinator = coordinator
         self._snapshot_manager = snapshot_manager
         self._recovery_manager = recovery_manager
+        self._hass = hass
 
     async def handle_command(self, command: dict[str, Any]) -> None:
         """Dispatch a decoded command dict. Raises InvalidCommandError on error."""
@@ -98,6 +123,8 @@ class CommandHandler:
             await self._handle_take_setup_snapshot(command)
         elif action == COMMAND_ACTION_RECOVER_WINDOW:
             await self._handle_recover_window(command)
+        elif action == COMMAND_ACTION_RENAME_DEVICE:
+            await self._handle_rename_device(command)
         elif action is None:
             raise InvalidCommandError("command missing 'action'")
         else:
@@ -174,6 +201,59 @@ class CommandHandler:
                     "recover_window: immediate heartbeat failed: %s: %s",
                     type(exc).__name__, exc,
                 )
+
+    async def _handle_rename_device(self, command: dict[str, Any]) -> None:
+        """Apply a `rename_device` command IN-PROCESS via HA's device registry.
+
+        This is the FIRST iEMS write INTO HA (contracts/mqtt_topics.md v0.4.0).
+        HACS runs inside HA, so there is no external WS round-trip — we call the
+        device-registry helper directly.  The write is label-only and
+        reversible: it sets the user-facing device name (`name_by_user`) and
+        NEVER touches entity_ids.
+
+        Validation is strict BEFORE the write: `device_id` and `name_by_user`
+        must both be non-empty strings, else InvalidCommandError → the
+        on_message wrapper logs + drops it (the callback never crashes).
+
+        An UNKNOWN device_id (the registry raises / has no such device) is also
+        logged + dropped, never propagated — a stale cloud-side device list must
+        not be able to kill the subscribe callback.
+        """
+        device_id = command.get("device_id")
+        name = command.get("name_by_user")
+        for field, value in (("device_id", device_id), ("name_by_user", name)):
+            if not isinstance(value, str) or not value.strip():
+                raise InvalidCommandError(
+                    f"rename_device missing/invalid {field!r}"
+                )
+        if self._hass is None:
+            raise InvalidCommandError(
+                "rename_device received but no hass is wired"
+            )
+        # Local import — homeassistant is only importable inside a running HA.
+        from homeassistant.helpers import device_registry as dr
+
+        registry = dr.async_get(self._hass)
+        try:
+            # async_update_device is SYNCHRONOUS (mutates the in-memory registry
+            # + schedules a debounced save).  name_by_user is the ONLY field we
+            # touch — entity_ids are never passed, so they are untouched.
+            registry.async_update_device(device_id, name_by_user=name)
+        except Exception as exc:  # noqa: BLE001 — see below
+            # An unknown device_id makes HA raise: depending on the HA version
+            # that is KeyError or HomeAssistantError (NOT a stable, importable
+            # ValueError subclass we can name without importing HA).  We catch
+            # broadly and re-wrap as InvalidCommandError so handle_command
+            # ALWAYS surfaces a registry-side failure uniformly (logged + dropped
+            # by on_message), and the subscribe callback can never crash on a
+            # stale cloud-side device list.
+            raise InvalidCommandError(
+                f"rename_device could not update {device_id!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        log.info(
+            "rename_device: set name_by_user for device %s", device_id
+        )
 
     async def on_message(self, raw: bytes | str | dict) -> bool:
         """awscrt-callback-facing entry point: decode + dispatch, never raises.

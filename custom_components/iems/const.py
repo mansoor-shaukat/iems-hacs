@@ -164,7 +164,8 @@ DOMAIN = "iems"
 # drops, so the 200-row chunk cap + 128 KiB guard headroom are unaffected. No
 # telemetry wire-shape / SCHEMA_VERSION (stays 0.6.0) / chunk-cap (200) / FSM
 # change. Patch release: bugfix + recovery write-efficiency, no contract change.
-VERSION = "0.5.1"
+# v0.5.2: add rename_device command (first cloud->HA write; label-only name_by_user).
+VERSION = "0.5.2"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"
@@ -325,6 +326,14 @@ COMMAND_ACTION_TAKE_SETUP_SNAPSHOT = "take_setup_snapshot"
 # `last_recovery` field. NO new MQTT topic, NO IAM change.
 # See docs/sprints/sprint_07/data_recovery_real_ha_check_spec.md.
 COMMAND_ACTION_RECOVER_WINDOW = "recover_window"
+# v0.5.2 (2026-06-27) — Devices Rename (contracts/mqtt_topics.md v0.4.0).
+# Cloud sends rename_device on the EXISTING command down-topic; HACS applies it
+# IN-PROCESS via HA's device-registry helper async_update_device(device_id,
+# name_by_user=…) — the FIRST iEMS write INTO HA.  Label-only + reversible:
+# changes the user-visible device name, NEVER entity_ids.  No new MQTT topic,
+# no IAM change.  Payload {"action":"rename_device","device_id":"<ha_device_id>",
+# "name_by_user":"<new name>"}.
+COMMAND_ACTION_RENAME_DEVICE = "rename_device"
 
 # Schema — MUST match server-side ingestion validator version
 SCHEMA_VERSION = "0.6.0"

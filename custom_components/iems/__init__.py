@@ -304,6 +304,10 @@ if _HA_AVAILABLE:
             coordinator=coordinator,
             snapshot_manager=snapshot_manager,
             recovery_manager=recovery_manager,
+            # Devices Rename (contracts/mqtt_topics.md v0.4.0) — the
+            # rename_device action applies a label-only device-registry write
+            # IN-PROCESS, so the handler needs the HA instance.
+            hass=hass,
         )
         status_client = HacsStatusClient(api_key=api_key)
         command_topic = COMMAND_TOPIC_TEMPLATE.format(user_id=creds.identity_id)
