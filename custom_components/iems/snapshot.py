@@ -218,6 +218,241 @@ def _build_entity_classifications(
     return classified
 
 
+# ---------------------------------------------------------------------------
+# automations[] — Smart Home (#21/#22), contract v0.14.0
+# ---------------------------------------------------------------------------
+#
+# HACS reads the user's HA automations and emits a COMPACT structured summary
+# (NEVER raw YAML) the cloud uses to derive the archetype (schedule vs event),
+# compose the plain-English headline, and group by room. The collector is split
+# the same way as the rest of this module: PURE shaping functions
+# (summarize_trigger / summarize_action / build_automations) that take plain
+# dicts, plus an impure shell (_extract_automations) that reads the live HA
+# automation config + state + registries.
+
+# The iEMS author marker. An automation HACS authors (#24, not yet built)
+# carries `author: "iems"` in the dict the extractor produces — derived from a
+# sentinel the write path stamps into the automation. The marker CONVENTION:
+# the cloud/HACS write path (#24) prefixes the automation `id` with
+# `IEMS_AUTHOR_ID_PREFIX` ("iems_") AND/OR sets a top-level `iems_authored: true`
+# in the automation config's `variables` block. The extractor below reads either
+# signal. TODAY no iEMS-authored automations exist, so in practice every
+# automation resolves to "user". `build_automations` only validates the already-
+# resolved `author` value against the contract enum (defence in depth); the
+# marker DETECTION lives in `_resolve_author` on the impure side.
+IEMS_AUTHOR_ID_PREFIX = "iems_"
+
+_VALID_AUTHORS = frozenset({"user", "iems"})
+
+# Compact trigger fields the contract allows (additionalProperties:false).
+# `platform` is the only required one. Everything else is optional/nullable.
+_TRIGGER_KEYS: tuple[str, ...] = (
+    "platform",
+    "entity_id",
+    "at",
+    "above",
+    "below",
+    "to",
+    "event",
+)
+
+# Compact action fields the contract allows. None required (an action with only
+# a data_summary is legal), but in practice `service` + `entity_id` carry the
+# headline.
+_ACTION_KEYS: tuple[str, ...] = (
+    "service",
+    "entity_id",
+    "target_area_id",
+    "data_summary",
+)
+
+# Hard ceiling on automations[] entries so a pathological install can't push the
+# setup payload past the 128 KiB IoT limit. A summarized automation is small
+# (~0.3-0.6 KiB), so 500 is far above any real home while keeping the snapshot
+# bounded. Dropped automations are logged loudly, never silently truncated.
+_MAX_AUTOMATIONS: int = 500
+
+
+def summarize_trigger(trig: dict[str, Any]) -> dict[str, Any]:
+    """Compact one HA trigger config -> the contract's trigger summary. PURE.
+
+    Reads BOTH the legacy `platform:` key and the newer (HA 2024.10+) `trigger:`
+    key — newer installs write `trigger:` and an extractor that only read
+    `platform` would emit a blank platform for every modern automation.
+
+    Carries ONLY the contract-allowed compact fields (`_TRIGGER_KEYS`); all raw-
+    YAML keys (`for`, `id`, `value_template`, ...) are dropped. The cloud needs
+    enough to (a) distinguish schedule (time/time_pattern/sun) from event-driven
+    (state/numeric_state/event/template) and (b) render the canonical condition
+    (the 4 grid-voltage entities + the below-50 threshold) — so we keep
+    entity_id / at / above / below / to / event.
+    """
+    # `platform` is canonical; `trigger` is the modern alias. Prefer whichever
+    # is present (platform wins if both, deterministic).
+    platform = trig.get("platform") or trig.get("trigger")
+    out: dict[str, Any] = {"platform": platform}
+    for key in _TRIGGER_KEYS:
+        if key == "platform":
+            continue
+        if key in trig and trig[key] is not None:
+            out[key] = trig[key]
+    return out
+
+
+def _data_summary(service: str | None, data: dict[str, Any] | None) -> str | None:
+    """Render a SHORT human-ish note of the key service data. PURE.
+
+    NOT the full data block — just enough for the cloud to say "turns blue" or
+    "to 22 C". Recognises the common light-colour shapes (the grid-lamp worked
+    example needs xy_color carried) and a few scalar comforts; otherwise falls
+    back to a compact "k=v" join of the first couple of keys. Returns None when
+    there's no data worth summarising.
+    """
+    if not data or not isinstance(data, dict):
+        return None
+    parts: list[str] = []
+    # Colour names / temperature first — the most descriptive.
+    if "color_name" in data:
+        parts.append(str(data["color_name"]))
+    if "xy_color" in data:
+        xy = data["xy_color"]
+        if isinstance(xy, (list, tuple)) and len(xy) == 2:
+            parts.append(f"xy {xy[0]},{xy[1]}")
+    if "rgb_color" in data:
+        rgb = data["rgb_color"]
+        if isinstance(rgb, (list, tuple)):
+            parts.append("rgb " + ",".join(str(c) for c in rgb))
+    if "color_temp_kelvin" in data:
+        parts.append(f"{data['color_temp_kelvin']}K")
+    if "temperature" in data:
+        parts.append(f"{data['temperature']}°")
+    if "brightness" in data:
+        parts.append(f"bri {data['brightness']}")
+    if parts:
+        return " / ".join(parts)
+    # Generic fallback: first two scalar keys, compactly. Skips nested blocks.
+    scalar_items = [
+        (k, v)
+        for k, v in data.items()
+        if isinstance(v, (str, int, float, bool))
+    ]
+    if not scalar_items:
+        return None
+    return " / ".join(f"{k}={v}" for k, v in scalar_items[:2])
+
+
+def summarize_action(act: dict[str, Any]) -> dict[str, Any]:
+    """Compact one HA action config -> the contract's action summary. PURE.
+
+    Reads BOTH the legacy `service:` key and the newer (HA 2024.10+) `action:`
+    key. Resolves the action target from either the flat `entity_id` /
+    `area_id` shape OR the nested `target:` block (the modern shape). Composes a
+    short `data_summary` from the service `data` — NOT the raw block.
+
+    Drops every raw-YAML key outside the compact `_ACTION_KEYS` set. The cloud
+    composes the headline action phrase ("the lamp turns blue") + the condition
+    strip from these fields.
+    """
+    service = act.get("service") or act.get("action")
+    target = act.get("target") if isinstance(act.get("target"), dict) else {}
+
+    # entity_id can sit at the top level OR under target (modern). Top-level
+    # wins when both present (deterministic); else fall back to target.
+    entity_id = act.get("entity_id")
+    if entity_id is None:
+        entity_id = target.get("entity_id")
+
+    # area_id only ever lives under target in a service call.
+    target_area_id = target.get("area_id")
+    if target_area_id is None:
+        target_area_id = act.get("area_id")
+
+    out: dict[str, Any] = {}
+    if service is not None:
+        out["service"] = service
+    if entity_id is not None:
+        out["entity_id"] = entity_id
+    if target_area_id is not None:
+        out["target_area_id"] = target_area_id
+    data_summary = _data_summary(service, act.get("data"))
+    if data_summary is not None:
+        out["data_summary"] = data_summary
+    return out
+
+
+def _resolve_author_value(author: Any) -> str:
+    """Validate an already-resolved author value against the contract enum.
+
+    Defence in depth on the PURE side: the impure extractor (`_resolve_author`)
+    does the marker detection and hands us "user" or "iems"; here we guarantee
+    the wire value is one of the two enum members so a junk value (a bug in a
+    future extractor, a hand-edited snapshot) can never leak past the contract.
+    Anything not exactly "iems" collapses to "user" (fail-safe: never falsely
+    claim iEMS authored a user's automation).
+    """
+    if author == "iems":
+        return "iems"
+    return "user"
+
+
+def _build_one_automation(auto: dict[str, Any]) -> dict[str, Any]:
+    """Shape ONE already-extracted automation dict -> the contract item. PURE.
+
+    `auto` carries: id, entity_id?, alias?, enabled, last_triggered?, mode?,
+    area_id?, author?, triggers[] (raw HA trigger configs), actions[] (raw HA
+    action configs). We whitelist + summarize so no raw YAML leaks.
+
+    `last_triggered` is OMITTED (not null) when the automation never fired — the
+    contract types it as the isoUtc $ref (pattern `Z$`) which forbids null, so a
+    never-fired automation must drop the key entirely. The portal degrades the
+    "last ran" stamp to hidden when the key is absent.
+    """
+    item: dict[str, Any] = {
+        "id": str(auto["id"]),
+        "enabled": bool(auto.get("enabled", False)),
+        "entity_id": auto.get("entity_id"),
+        "alias": auto.get("alias"),
+        "mode": auto.get("mode"),
+        "area_id": auto.get("area_id"),
+        "author": _resolve_author_value(auto.get("author")),
+        "triggers": [summarize_trigger(t) for t in (auto.get("triggers") or [])],
+        "actions": [summarize_action(a) for a in (auto.get("actions") or [])],
+    }
+    # last_triggered: include ONLY when present (never-fired -> key absent).
+    last_triggered = auto.get("last_triggered")
+    if last_triggered:
+        item["last_triggered"] = last_triggered
+    return item
+
+
+def build_automations(automations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Shape a list of extracted automation dicts -> the contract array. PURE.
+
+    Deterministic (sorted by id), non-mutating, no I/O, no HA. Each input dict
+    is the merge of an automation's raw config + its live-state bits + the
+    HACS-resolved action-target area_id (see `_extract_automations`). Output
+    items conform to `setup_snapshot.schema.json#/properties/automations/items`.
+
+    Capped at `_MAX_AUTOMATIONS` (after sort) with a loud log — never silently
+    truncated — so a pathological install can't trip the 128 KiB IoT limit.
+    """
+    if not automations:
+        return []
+    built = [_build_one_automation(a) for a in automations]
+    built.sort(key=lambda item: item["id"])
+    if len(built) > _MAX_AUTOMATIONS:
+        dropped = len(built) - _MAX_AUTOMATIONS
+        log.warning(
+            "setup snapshot: %d automations found, capping automations[] at %d "
+            "(dropping %d) to stay under the 128 KiB IoT payload limit",
+            len(built),
+            _MAX_AUTOMATIONS,
+            dropped,
+        )
+        built = built[:_MAX_AUTOMATIONS]
+    return built
+
+
 def build_setup_snapshot(
     *,
     user_id: str,
@@ -227,6 +462,7 @@ def build_setup_snapshot(
     source_kind: str,
     ts: str,
     entity_index: dict[str, dict[str, Any]] | None = None,
+    automations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build a `setup_snapshot.schema.json`-conforming payload. PURE.
 
@@ -260,6 +496,14 @@ def build_setup_snapshot(
         back-compat path. This is the field whose absence produced an EMPTY
         onboarding for the CEO's real home (no Energy Dashboard configured) on
         2026-06-10; see module docstring.
+    automations
+        Optional list of extracted HA automation dicts (raw config merged with
+        live-state bits + HACS-resolved area_id; see `_extract_automations`).
+        Threaded through `build_automations` into the optional, additive
+        top-level `automations[]` (contract v0.14.0, Smart Home #21/#22). `None`
+        (omitted) leaves the key ABSENT — a back-compat / pre-Smart-Home path.
+        An empty list emits an empty `automations[]` (a home with zero
+        automations — distinct from "never collected").
 
     Returns
     -------
@@ -284,7 +528,7 @@ def build_setup_snapshot(
     device_registry_snapshot = [_project(d, _DEVICE_KEYS) for d in devices]
     entity_classifications = _build_entity_classifications(entity_index)
 
-    return {
+    snapshot: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "user_id": user_id,
         "ts": ts,
@@ -301,6 +545,18 @@ def build_setup_snapshot(
         # _build_entity_classifications.
         "entity_classifications": entity_classifications,
     }
+
+    # automations[] is OPTIONAL + ADDITIVE (contract v0.14.0). Emit the key ONLY
+    # when the caller supplies an automations list — a pre-Smart-Home install
+    # (or a caller that didn't read the automation registry) omits it entirely,
+    # which is exactly how the contract degrades (cloud has no automation cache,
+    # Smart Home tab shows the empty state). `None` -> key absent; `[]` -> the
+    # key is present and empty (a home with zero automations, a real state the
+    # cloud distinguishes from "never collected").
+    if automations is not None:
+        snapshot["automations"] = build_automations(automations)
+
+    return snapshot
 
 
 class SetupSnapshotManager:
@@ -479,6 +735,228 @@ async def _fetch_energy_prefs(hass) -> dict[str, Any] | None:
     return getattr(manager, "data", None)
 
 
+def _last_triggered_iso_z(state_obj) -> str | None:
+    """Render an automation's `last_triggered` attribute as ISO-8601 UTC Z.
+
+    HA stores `last_triggered` as a tz-aware `datetime` (or None if never
+    fired). Returns the Z-suffixed string the contract requires, or None when
+    the automation has never triggered. Mirrors the `_dt_to_iso_z` pattern in
+    recovery.py — strftime to a trailing Z, never `+00:00`. Tolerates a string
+    value (older HA / recorder rows) by normalising +00:00 → Z.
+    """
+    from datetime import datetime, timezone
+
+    raw = None
+    if state_obj is not None:
+        raw = state_obj.attributes.get("last_triggered")
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if isinstance(raw, str) and raw.strip():
+        s = raw.strip()
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            log.warning(
+                "setup snapshot: unparseable automation last_triggered %r; "
+                "omitting", raw,
+            )
+            return None
+    return None
+
+
+def _first_action_entity_id(actions: list[dict[str, Any]]) -> str | None:
+    """Return the entity_id of the PRIMARY action target. Impure-input, pure.
+
+    The PRIMARY action is the FIRST action that targets a concrete entity (per
+    the design grouping rule: group by the entity the automation CHANGES, not
+    the trigger source). Reads the modern `target:` block and the flat
+    `entity_id` shape; a list entity_id resolves to its first member. Returns
+    None when no action names an entity (e.g. a notify-only automation) — the
+    caller then resolves area to None ⇒ cloud buckets under "Whole Home".
+    """
+    for act in actions or []:
+        target = act.get("target") if isinstance(act.get("target"), dict) else {}
+        entity_id = act.get("entity_id")
+        if entity_id is None:
+            entity_id = target.get("entity_id")
+        if isinstance(entity_id, list):
+            entity_id = entity_id[0] if entity_id else None
+        if isinstance(entity_id, str) and entity_id:
+            return entity_id
+    return None
+
+
+def _resolve_action_area(hass, actions: list[dict[str, Any]]) -> str | None:
+    """Resolve the area_id of an automation's PRIMARY ACTION TARGET. Impure.
+
+    Per the design grouping rule the tab groups by the room the automation
+    AFFECTS — i.e. the area of the entity the action CHANGES, never the trigger
+    source. Resolution order for the primary action's entity:
+      1. an explicit `target.area_id` on the action wins (the user named an area
+         directly — no entity to resolve);
+      2. else the action's primary target entity → entity_registry → its own
+         area_id, falling back to its device's area_id (same precedence as
+         `__init__._build_entity_index`).
+    Returns None when unresolvable (no entity / no area / registries
+    unavailable) ⇒ cloud buckets the automation under "Whole Home".
+    """
+    # 1. explicit area on any action target wins.
+    for act in actions or []:
+        target = act.get("target") if isinstance(act.get("target"), dict) else {}
+        area_id = target.get("area_id") or act.get("area_id")
+        if isinstance(area_id, list):
+            area_id = area_id[0] if area_id else None
+        if isinstance(area_id, str) and area_id:
+            return area_id
+
+    # 2. resolve via the primary action target entity.
+    entity_id = _first_action_entity_id(actions)
+    if not entity_id:
+        return None
+    try:
+        from homeassistant.helpers import (  # local — HA only
+            device_registry as dr,
+            entity_registry as er,
+        )
+    except ImportError:
+        return None
+    er_reg = er.async_get(hass)
+    ent = er_reg.async_get(entity_id)
+    if ent is None:
+        return None
+    if ent.area_id:
+        return ent.area_id
+    if ent.device_id:
+        dr_reg = dr.async_get(hass)
+        device = dr_reg.async_get(ent.device_id)
+        if device is not None and device.area_id:
+            return device.area_id
+    return None
+
+
+def _resolve_author(raw_config: dict[str, Any], automation_id: str) -> str:
+    """Detect the iEMS author marker on an automation config. Impure-input, pure.
+
+    The marker CONVENTION (documented in this module's header) — an automation
+    HACS authors (#24, not yet built) is tagged either by:
+      - an `id` prefixed with `IEMS_AUTHOR_ID_PREFIX` ("iems_"), or
+      - a top-level `variables.iems_authored: true` in the config.
+    Returns "iems" when EITHER signal is present, else "user". TODAY no iEMS-
+    authored automations exist (the writer is slice #24), so this returns "user"
+    for every current automation — but the reader is ready for when #24 lands.
+    """
+    if isinstance(automation_id, str) and automation_id.startswith(
+        IEMS_AUTHOR_ID_PREFIX
+    ):
+        return "iems"
+    variables = raw_config.get("variables")
+    if isinstance(variables, dict) and variables.get("iems_authored") is True:
+        return "iems"
+    return "user"
+
+
+def _as_list(value: Any) -> list[Any]:
+    """Normalise a HA config block that may be a single dict or a list. PURE.
+
+    HA automation `trigger`/`action` may be a single mapping OR a list of
+    mappings; `condition` similarly. Returns a list either way; a None/missing
+    block returns []. Non-dict members are dropped (defensive against malformed
+    configs).
+    """
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        return [v for v in value if isinstance(v, dict)]
+    return []
+
+
+def _extract_automations(hass) -> list[dict[str, Any]]:
+    """Read the user's HA automations into extractor dicts. Impure shell.
+
+    Sources, all read IN-PROCESS (HACS runs inside HA — no WS round-trip):
+      - the `automation` integration's EntityComponent (`hass.data['automation']`)
+        for each automation's `raw_config` (id / alias / mode / trigger / action)
+        and its `entity_id`;
+      - `hass.states.get(entity_id)` for the live `state` (on/off → enabled) and
+        the `last_triggered` attribute;
+      - the entity + device + area registries to resolve the PRIMARY ACTION
+        TARGET's area_id (the grouping axis).
+
+    Returns a list of dicts in the shape `build_automations` consumes. NEVER
+    raises into the caller — a missing automation component (no automations
+    configured) or a malformed single config is logged and skipped, so the
+    snapshot still publishes. The PURE `build_automations` does the final
+    whitelist + summary + contract shaping.
+    """
+    component = hass.data.get("automation") if hasattr(hass, "data") else None
+    entities = getattr(component, "entities", None)
+    if not entities:
+        return []
+
+    out: list[dict[str, Any]] = []
+    for ent in entities:
+        try:
+            raw_config = getattr(ent, "raw_config", None) or {}
+            entity_id = getattr(ent, "entity_id", None)
+            # unique_id is the automation's stable `id`; fall back to the
+            # raw_config id, then the entity_id (last resort — still unique).
+            automation_id = (
+                getattr(ent, "unique_id", None)
+                or raw_config.get("id")
+                or entity_id
+            )
+            if automation_id is None:
+                log.warning(
+                    "setup snapshot: automation with no id (entity_id=%r); "
+                    "skipping", entity_id,
+                )
+                continue
+
+            state_obj = (
+                hass.states.get(entity_id) if entity_id is not None else None
+            )
+            enabled = state_obj is not None and state_obj.state == "on"
+
+            triggers = _as_list(
+                raw_config.get("trigger", raw_config.get("triggers"))
+            )
+            actions = _as_list(
+                raw_config.get("action", raw_config.get("actions"))
+            )
+
+            out.append(
+                {
+                    "id": automation_id,
+                    "entity_id": entity_id,
+                    "alias": raw_config.get("alias"),
+                    "enabled": enabled,
+                    "last_triggered": _last_triggered_iso_z(state_obj),
+                    "mode": raw_config.get("mode"),
+                    "area_id": _resolve_action_area(hass, actions),
+                    "author": _resolve_author(raw_config, automation_id),
+                    "triggers": triggers,
+                    "actions": actions,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 — one bad config must not
+            # sink the whole snapshot; log + skip the offending automation.
+            log.warning(
+                "setup snapshot: skipping unreadable automation %r: %s: %s",
+                getattr(ent, "entity_id", "<unknown>"),
+                type(exc).__name__, exc,
+            )
+    return out
+
+
 async def collect_setup_snapshot(
     hass,
     *,
@@ -499,6 +977,11 @@ async def collect_setup_snapshot(
     `entity_classifications[]` is classified from the SAME index the telemetry
     whitelist uses — no second registry walk, no drift. `None` (not supplied)
     emits an empty `entity_classifications[]`.
+
+    The HA automation registry is read here too (`_extract_automations`) and
+    threaded into the optional, additive `automations[]` (Smart Home #21/#22).
+    The extractor never raises — a home with no automations yields [], and the
+    snapshot still publishes.
     """
     from datetime import datetime, timezone
 
@@ -506,6 +989,7 @@ async def collect_setup_snapshot(
     config = _extract_site_config(hass)
     energy_prefs = await _fetch_energy_prefs(hass)
     devices = _extract_devices(hass)
+    automations = _extract_automations(hass)
     return build_setup_snapshot(
         user_id=user_id,
         config=config,
@@ -514,4 +998,5 @@ async def collect_setup_snapshot(
         source_kind=source_kind,
         ts=ts,
         entity_index=entity_index,
+        automations=automations,
     )

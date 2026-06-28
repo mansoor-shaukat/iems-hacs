@@ -165,7 +165,13 @@ DOMAIN = "iems"
 # telemetry wire-shape / SCHEMA_VERSION (stays 0.6.0) / chunk-cap (200) / FSM
 # change. Patch release: bugfix + recovery write-efficiency, no contract change.
 # v0.5.2: add rename_device command (first cloud->HA write; label-only name_by_user).
-VERSION = "0.5.2"
+# v0.5.3: edge-PoC lamp control RETIRED (CEO 2026-06-28). The living-room lamp's
+# grid-state control moved to a native HA automation so the lamp has ONE owner;
+# HACS no longer starts the EdgePocOutageHandler (wiring disabled in __init__.py)
+# and the handler is additionally guarded by LAMP_CONTROL_RETIRED. HACS never
+# writes light.living_lamp. No telemetry/heartbeat/snapshot/dispatch/recovery
+# change; no contract / SCHEMA_VERSION change. Reversible point release.
+VERSION = "0.5.3"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"

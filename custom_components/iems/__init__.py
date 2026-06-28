@@ -9,11 +9,12 @@ async_setup_entry responsibilities:
   5. Build entity_index from HA's registries.
   6. Construct IemsCoordinator, subscribe to state_changed, start
      batch + heartbeat timers.
-  7. Wire EdgePocOutageHandler (Sprint 5 Track B) — grid-off → outage color
-     (blue per CEO directive 2026-05-01), grid-on → restore. Local-only,
-     zero cloud round-trip.
-  8. Stash adapter/coordinator/publisher/edge_poc_handler in hass.data
-     for unload.
+  7. (RETIRED 2026-06-28) The Sprint 5 Track B EdgePocOutageHandler lamp
+     control is no longer wired here — the living-room lamp is now owned by a
+     native HA automation, so HACS must never write to light.living_lamp. The
+     handler module remains in the tree (guarded by LAMP_CONTROL_RETIRED) for
+     reversibility. See the retirement note in async_setup_entry.
+  8. Stash adapter/coordinator/publisher in hass.data for unload.
 
 The auth provider is the ONLY entry point to cloud endpoint routing —
 there are no `IOT_ENDPOINT` / `IOT_PORT` / `DEV_USER_ID` hardcodes
@@ -61,7 +62,12 @@ from .command_handler import CommandHandler
 from .config_flow import _is_legacy_unique_id
 from .const import COMMAND_TOPIC_TEMPLATE
 from .coordinator import IemsCoordinator
-from .edge_poc_outage import EdgePocOutageHandler, register_services, resolve_db_path
+# Edge-PoC lamp control RETIRED (CEO 2026-06-28) — native HA automation owns
+# light.living_lamp; HACS no longer starts the handler. Import left commented
+# (not deleted) so the wiring is reversible in one place. To restore: uncomment
+# this import, restore the three wiring lines in async_setup_entry, and flip
+# edge_poc_outage.LAMP_CONTROL_RETIRED → False.
+# from .edge_poc_outage import EdgePocOutageHandler, register_services, resolve_db_path
 from .publisher import TelemetryPublisher
 from .recovery import RecoveryManager
 from .snapshot import SetupSnapshotManager, collect_setup_snapshot
@@ -406,22 +412,39 @@ if _HA_AVAILABLE:
         else:  # pragma: no cover — HA core too old for background tasks
             hass.async_create_task(_deferred_onboarding_wiring())
 
-        # Sprint 5 Track B — Edge PoC: outage signal → light.living_lamp blue.
-        # CEO directive 2026-05-01: blue (was amber Day 1-4).
-        # Local-only (no cloud round-trip). Single-site PoC (Mansoor's home).
+        # Sprint 5 Track B — Edge PoC lamp control: RETIRED (CEO 2026-06-28).
+        #
+        # The living-room lamp's grid-state control moved OFF this HACS edge-PoC
+        # and ONTO a native Home Assistant automation (CTO-authored) so the lamp
+        # has exactly ONE owner. HACS must NEVER write to light.living_lamp —
+        # neither cool-white on grid-up nor blue on grid-down — otherwise the two
+        # owners fight (the edge-PoC repaints cool-white on grid-up while the
+        # native automation wants the lamp left alone except during an outage).
+        #
+        # We therefore no longer start the handler or register its services. The
+        # EdgePocOutageHandler module (edge_poc_outage.py) is left intact and is
+        # additionally guarded by its LAMP_CONTROL_RETIRED kill-switch, so this
+        # is fully reversible: restore the three lines below AND flip
+        # LAMP_CONTROL_RETIRED → False to bring the lamp indicator back.
+        #
+        #   db_path = resolve_db_path(hass)
+        #   edge_poc = EdgePocOutageHandler(hass=hass, db_path=db_path)
+        #   register_services(hass, edge_poc)
+        #   await edge_poc.async_start()
+        #
+        # Everything else HACS does (telemetry, heartbeat, setup snapshot,
+        # dispatch, recovery) is unaffected.
         # See: docs/integrations/edge_poc_outage_color.md
-        db_path = resolve_db_path(hass)
-        edge_poc = EdgePocOutageHandler(hass=hass, db_path=db_path)
-        register_services(hass, edge_poc)
-        await edge_poc.async_start()
-        log.info("iems: edge-poc outage handler started; db=%s", db_path)
+        log.info(
+            "iems: edge-poc lamp control retired (CEO 2026-06-28) — native HA "
+            "automation owns light.living_lamp; HACS does not touch it"
+        )
 
         hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
             "coordinator": coordinator,
             "adapter": adapter,
             "publisher": publisher,
             "auth": auth,
-            "edge_poc": edge_poc,
             # Onboarding v2 (#4) — kept so the take_setup_snapshot command
             # handler can re-publish a rescan snapshot.
             "snapshot_manager": snapshot_manager,

@@ -1,3 +1,13 @@
+# ⚠️ RETIRED (CEO 2026-06-28) — DO NOT LOAD.
+# The living-room lamp's grid-state control moved OFF this HACS edge-PoC and
+# ONTO a native Home Assistant automation (CTO-authored) so the lamp has exactly
+# ONE owner. As of v0.5.3 HACS no longer registers the iems.edge_poc_outage_*
+# services these automations call — loading this file would only log
+# "service not found" warnings; it cannot paint the lamp. Kept in-tree as the
+# colour/entity reference for the native automation and for one-flag
+# reversibility (see edge_poc_outage.LAMP_CONTROL_RETIRED). The blue/cool-white
+# colour values + the 4 canonical voltage entities below are still the spec.
+#
 # Edge PoC — Outage signal → light.living_lamp blue
 # Sprint 5 Track B. Single-site PoC. Mansoor's home.
 #

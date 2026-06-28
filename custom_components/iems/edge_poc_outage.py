@@ -123,6 +123,23 @@ CREATE TABLE IF NOT EXISTS poc_decisions (
 _STATE_GRID_UP = "cool_white"
 _STATE_GRID_DOWN = "blue"
 
+# ── Lamp control retired → native HA automation owns the lamp (CEO 2026-06-28) ──
+# CEO moved the living-room lamp's grid-state control OFF this HACS edge-PoC and
+# ONTO a native Home Assistant automation (CTO-authored). The lamp now has exactly
+# ONE owner. When this flag is True the edge-PoC NEVER writes to light.living_lamp —
+# not cool-white on grid-up, not blue on grid-down. The grid-detection helper
+# (_grid_is_down) and the SQLite decision log remain present but the apply path is
+# a no-op, so HACS and the native automation can never fight over the lamp.
+#
+# Primary disable is at the wiring layer (__init__.py no longer starts the handler
+# or registers the services). This module-level guard is belt-and-braces: even a
+# direct async_start()/service call cannot paint the lamp while it is True.
+#
+# REVERSIBLE: flip this to False AND restore the 3 wiring lines in __init__.py
+# (EdgePocOutageHandler(...) / register_services(...) / await edge_poc.async_start())
+# to bring the edge-PoC lamp indicator back. No other code was deleted.
+LAMP_CONTROL_RETIRED: bool = True
+
 
 # --------------------------------------------------------------------------
 # Grid-down detection (canonical AND-of-all rule)
@@ -435,7 +452,20 @@ class EdgePocOutageHandler:
 
         Used by _debounced_apply (post-debounce) and by async_start
         (immediate startup paint, no debounce).
+
+        RETIRED (CEO 2026-06-28): when LAMP_CONTROL_RETIRED is set, this is a
+        hard no-op — the edge-PoC never issues a light.turn_on. The native HA
+        automation is the sole owner of light.living_lamp. Belt-and-braces with
+        the wiring-layer disable in __init__.py.
         """
+        if LAMP_CONTROL_RETIRED:
+            log.debug(
+                "edge_poc: lamp control retired — suppressing %s apply "
+                "(native HA automation owns light.living_lamp)", target,
+            )
+            self._target_state = target
+            return
+
         t0 = time.monotonic()
         success = False
         event_type = (
