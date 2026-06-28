@@ -171,7 +171,15 @@ DOMAIN = "iems"
 # and the handler is additionally guarded by LAMP_CONTROL_RETIRED. HACS never
 # writes light.living_lamp. No telemetry/heartbeat/snapshot/dispatch/recovery
 # change; no contract / SCHEMA_VERSION change. Reversible point release.
-VERSION = "0.5.3"
+# v0.5.4 (2026-06-28): Smart Home automation toggle — enable_automation command
+# (contracts/mqtt_topics.md v0.4.1, GitHub #23). Cloud sends enable_automation
+# on the EXISTING command down-topic; HACS resolves id→entity_id IN-PROCESS
+# via hass.data['automation'].entities (unique_id == stable id, same source as
+# _extract_automations in snapshot.py) then calls automation.turn_on /
+# automation.turn_off via hass.services.call(blocking=True). Unknown ids are
+# logged and dropped (automation_not_found) — never crash the callback. No new
+# MQTT topic, no IAM change. No wire-shape / SCHEMA_VERSION / FSM change.
+VERSION = "0.5.4"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"
@@ -340,6 +348,18 @@ COMMAND_ACTION_RECOVER_WINDOW = "recover_window"
 # no IAM change.  Payload {"action":"rename_device","device_id":"<ha_device_id>",
 # "name_by_user":"<new name>"}.
 COMMAND_ACTION_RENAME_DEVICE = "rename_device"
+# v0.5.4 (2026-06-28) — Smart Home automation toggle (contracts/mqtt_topics.md
+# v0.4.1, GitHub #23). Cloud sends enable_automation on the EXISTING command
+# down-topic; HACS applies it IN-PROCESS via HA's automation service calls
+# (automation.turn_on / automation.turn_off).  The command carries the
+# automation stable `id` (NOT the entity_id slug); HACS resolves id→entity_id
+# by scanning the automation EntityComponent in hass.data['automation'] (the
+# same in-process source the setup snapshot uses — snapshot.py:_extract_automations).
+# unique_id on each automation entity equals its stable id.  Reversible: only
+# changes the enabled state, never touches entity_ids or automation config.
+# No new MQTT topic, no IAM change.
+# Payload: {"action":"enable_automation","id":"<ha_automation_id>","enabled":true|false}
+COMMAND_ACTION_ENABLE_AUTOMATION = "enable_automation"
 
 # Schema — MUST match server-side ingestion validator version
 SCHEMA_VERSION = "0.6.0"
