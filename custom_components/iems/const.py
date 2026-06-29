@@ -179,7 +179,25 @@ DOMAIN = "iems"
 # automation.turn_off via hass.services.call(blocking=True). Unknown ids are
 # logged and dropped (automation_not_found) — never crash the callback. No new
 # MQTT topic, no IAM change. No wire-shape / SCHEMA_VERSION / FSM change.
-VERSION = "0.5.4"
+# v0.5.5 (2026-06-28): Smart Home write + delete automation commands
+# (contracts/mqtt_topics.md v0.4.2, GitHub #24 + #29). Cloud sends
+# write_automation to create/update an automation config and delete_automation
+# to remove one; both use the EXISTING command down-topic (no new MQTT topic,
+# no IAM change). HACS applies them IN-PROCESS via HA's config automation
+# StorageCollection (hass.data["automation_config"]) — the same storage HA's
+# Lovelace automation editor uses; no external WS round-trip, no auth token
+# required. After each write or delete the automation component is reloaded
+# so the change takes effect immediately. write_automation is idempotent on
+# draft_token: a duplicate draft_token is logged and dropped without a second
+# write (per-instance set on CommandHandler). The cloud already stamps
+# variables.iems_authored + an iems_ id prefix — HACS preserves both so the
+# setup snapshot's _resolve_author marks these as "iems". An unknown
+# automation_id in delete_automation is logged and no-op (never crash the
+# callback). No wire-shape / SCHEMA_VERSION / FSM change.
+# Payload write: {"action":"write_automation","automation_id":"<iems_id>",
+#                 "draft_token":"<uuid>","automation":{...full HA config...}}
+# Payload delete: {"action":"delete_automation","id":"<ha_automation_id>"}
+VERSION = "0.5.5"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"
@@ -360,6 +378,14 @@ COMMAND_ACTION_RENAME_DEVICE = "rename_device"
 # No new MQTT topic, no IAM change.
 # Payload: {"action":"enable_automation","id":"<ha_automation_id>","enabled":true|false}
 COMMAND_ACTION_ENABLE_AUTOMATION = "enable_automation"
+# v0.5.5 (2026-06-28) — Smart Home write + delete (contracts/mqtt_topics.md
+# v0.4.2, GitHub #24 + #29). Both ride the existing command down-topic.
+# write_automation creates or updates an automation IN-PROCESS via HA's config
+# automation StorageCollection (hass.data["automation_config"]), idempotent on
+# draft_token.  delete_automation removes an automation by id; unknown id =
+# no-op (never crash the callback).
+COMMAND_ACTION_WRITE_AUTOMATION = "write_automation"
+COMMAND_ACTION_DELETE_AUTOMATION = "delete_automation"
 
 # Schema — MUST match server-side ingestion validator version
 SCHEMA_VERSION = "0.6.0"

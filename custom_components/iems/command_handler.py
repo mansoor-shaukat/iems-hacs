@@ -27,6 +27,16 @@ subscribe callback and the coordinator/snapshot FSM:
                               {"entity_id": <resolved_entity_id>},
                               blocking=True)                        (any mode)
 
+    {"action": "write_automation", "automation_id": "<iems_id>",
+     "draft_token": "<uuid>", "automation": {...full HA config...}}
+        -> hass.data["automation_config"].async_update_item(id, config)
+           or async_create_item(config) if not found, then automation.reload
+           Idempotent on draft_token: duplicate token → log + no-op.
+
+    {"action": "delete_automation", "id": "<ha_automation_id>"}
+        -> hass.data["automation_config"].async_delete_item(id)
+           then automation.reload. Unknown id → log + no-op.
+
 `rename_device` (contracts/mqtt_topics.md v0.4.0) is the FIRST iEMS write INTO
 HA.  HACS runs inside HA, so it applies the label change in-process via the
 device-registry helper — no external WS round-trip.  It is label-only and
@@ -43,6 +53,16 @@ EntityComponent in hass.data['automation'] (the same source _extract_automations
 in snapshot.py uses — unique_id on each automation entity equals its stable id).
 If no automation matches the id, the command is logged and dropped as
 automation_not_found; the subscribe callback never crashes.
+
+`write_automation` + `delete_automation` (contracts/mqtt_topics.md v0.4.2,
+GitHub #24 + #29) are the THIRD and FOURTH iEMS writes INTO HA.  Both use
+HA's config automation StorageCollection (hass.data["automation_config"]) — the
+same storage HA's own Lovelace automation editor uses.  `write_automation` is
+idempotent on draft_token: the CommandHandler maintains a per-instance set of
+seen tokens; a duplicate token is logged and dropped without a second write.
+The cloud stamps variables.iems_authored + an iems_ id prefix — HACS preserves
+both so the setup snapshot's _resolve_author correctly labels these "iems".
+`delete_automation` is a no-op for unknown ids (logged, never crashes).
 
 Design — pure decode + thin dispatch
 ------------------------------------
@@ -61,11 +81,13 @@ import logging
 from typing import Any
 
 from .const import (
+    COMMAND_ACTION_DELETE_AUTOMATION,
     COMMAND_ACTION_ENABLE_AUTOMATION,
     COMMAND_ACTION_RECOVER_WINDOW,
     COMMAND_ACTION_RENAME_DEVICE,
     COMMAND_ACTION_SET_SHIPPING_MODE,
     COMMAND_ACTION_TAKE_SETUP_SNAPSHOT,
+    COMMAND_ACTION_WRITE_AUTOMATION,
 )
 
 log = logging.getLogger("iems.command_handler")
@@ -113,9 +135,21 @@ class CommandHandler:
         recovery feature isn't wired (a `recover_window` command then logs +
         drops as un-dispatchable, never crashing the callback).
       - `hass` — optional HomeAssistant instance.  Needed by `rename_device`
-        (device-registry write) and `enable_automation` (automation service
-        call).  None when the handler isn't wired with HA (those commands then
-        log + drop as un-dispatchable, never crashing the callback).
+        (device-registry write), `enable_automation` (automation service call),
+        `write_automation` (automation config write), and `delete_automation`
+        (automation config delete).  None when the handler isn't wired with HA
+        (those commands then log + drop as un-dispatchable, never crashing the
+        callback).
+
+    `_seen_draft_tokens` is a per-instance set maintained for draft_token
+    idempotency on `write_automation`.  The CommandHandler is long-lived (one
+    instance per HACS config entry setup), so the set accumulates across the
+    entry's lifetime.  A duplicate draft_token means the cloud retried a command
+    the HACS already applied — the second delivery is silently dropped.  The set
+    is intentionally NOT persisted across HA restarts: an in-flight command that
+    was applied but whose ack was lost will be re-applied on restart, which is
+    safe because the automation config is idempotent (write with the same data
+    is a no-op at the HA storage level).
     """
 
     def __init__(
@@ -130,6 +164,9 @@ class CommandHandler:
         self._snapshot_manager = snapshot_manager
         self._recovery_manager = recovery_manager
         self._hass = hass
+        # draft_token idempotency set for write_automation (#24, v0.5.5).
+        # Per-instance, non-persistent — see class docstring.
+        self._seen_draft_tokens: set[str] = set()
 
     async def handle_command(self, command: dict[str, Any]) -> None:
         """Dispatch a decoded command dict. Raises InvalidCommandError on error."""
@@ -144,6 +181,10 @@ class CommandHandler:
             await self._handle_rename_device(command)
         elif action == COMMAND_ACTION_ENABLE_AUTOMATION:
             await self._handle_enable_automation(command)
+        elif action == COMMAND_ACTION_WRITE_AUTOMATION:
+            await self._handle_write_automation(command)
+        elif action == COMMAND_ACTION_DELETE_AUTOMATION:
+            await self._handle_delete_automation(command)
         elif action is None:
             raise InvalidCommandError("command missing 'action'")
         else:
@@ -373,6 +414,208 @@ class CommandHandler:
             if getattr(ent, "unique_id", None) == automation_id:
                 return getattr(ent, "entity_id", None)
         return None
+
+    async def _handle_write_automation(self, command: dict[str, Any]) -> None:
+        """Write (create or update) an automation config IN-PROCESS via HA's
+        config automation StorageCollection.
+
+        This is the THIRD iEMS write INTO HA (contracts/mqtt_topics.md v0.4.2,
+        GitHub #24).  HACS runs inside HA — the automation config StorageCollection
+        at hass.data["automation_config"] is the same storage HA's Lovelace
+        automation editor uses; no external WS round-trip, no auth token required.
+
+        After the write the automation component is reloaded via
+        hass.services.call("automation", "reload") so the change takes effect
+        immediately.
+
+        The cloud stamps variables.iems_authored: true AND prefixes the
+        automation id with "iems_" — HACS preserves both unchanged so the
+        setup snapshot's _resolve_author correctly labels the automation "iems".
+
+        Idempotency on draft_token
+        --------------------------
+        The cloud may re-deliver a command if the HACS ack was lost.  The
+        CommandHandler maintains a per-instance set (_seen_draft_tokens).  A
+        duplicate draft_token is logged and dropped without a second write —
+        the automation config is already in place.
+
+        Validation (strict, BEFORE the write):
+          - 'automation_id' must be a non-empty string.
+          - 'automation' must be a dict (the full HA automation config).
+          - 'draft_token' must be a non-empty string.
+          - hass must be wired.
+
+        A storage-layer failure (e.g. malformed config rejected by HA) is
+        caught and re-wrapped as InvalidCommandError so the callback can log +
+        drop it; the subscribe callback never crashes.
+        """
+        automation_id = command.get("automation_id")
+        automation_cfg = command.get("automation")
+        draft_token = command.get("draft_token")
+
+        if not isinstance(automation_id, str) or not automation_id.strip():
+            raise InvalidCommandError(
+                "write_automation missing/invalid 'automation_id'"
+            )
+        if not isinstance(automation_cfg, dict):
+            raise InvalidCommandError(
+                "write_automation 'automation' must be a dict, "
+                f"got {type(automation_cfg).__name__!r}"
+            )
+        if not isinstance(draft_token, str) or not draft_token.strip():
+            raise InvalidCommandError(
+                "write_automation missing/invalid 'draft_token'"
+            )
+        if self._hass is None:
+            raise InvalidCommandError(
+                "write_automation received but no hass is wired"
+            )
+
+        # Idempotency: drop duplicate deliveries without a second write.
+        if draft_token in self._seen_draft_tokens:
+            log.info(
+                "write_automation: draft_token %r already applied — no-op",
+                draft_token,
+            )
+            return
+
+        # Access HA's config automation StorageCollection IN-PROCESS.
+        # hass.data["automation_config"] is the StorageCollection used by HA's
+        # own Lovelace automation editor (homeassistant.components.config.automation).
+        # It exposes async_update_item(id, data) and async_create_item(data).
+        collection = (
+            self._hass.data.get("automation_config")
+            if hasattr(self._hass, "data")
+            else None
+        )
+        if collection is None:
+            raise InvalidCommandError(
+                "write_automation: automation_config storage not available in hass.data"
+            )
+
+        try:
+            # Try update first (idempotent for existing automations).  If the
+            # automation doesn't exist yet, fall through to create.
+            existing_ids = (
+                set(collection.async_items().keys())
+                if hasattr(collection, "async_items")
+                else set()
+            )
+            if automation_id in existing_ids:
+                await collection.async_update_item(automation_id, automation_cfg)
+                log.info(
+                    "write_automation: updated automation %r (draft_token=%r)",
+                    automation_id, draft_token,
+                )
+            else:
+                await collection.async_create_item(automation_cfg)
+                log.info(
+                    "write_automation: created automation %r (draft_token=%r)",
+                    automation_id, draft_token,
+                )
+        except Exception as exc:  # noqa: BLE001 — HA storage errors vary by version
+            raise InvalidCommandError(
+                f"write_automation: storage write failed for {automation_id!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        # Mark token AFTER a successful write so a storage failure on the first
+        # attempt doesn't lock out a legitimate retry.
+        self._seen_draft_tokens.add(draft_token)
+
+        # Reload the automation component so the new config takes effect now
+        # (not only on the next HA restart).  Best-effort: a reload failure is
+        # logged but MUST NOT un-do the write or crash the callback.
+        try:
+            await self._hass.services.call(
+                "automation", "reload", blocking=True
+            )
+        except Exception as exc:  # noqa: BLE001 — reload failure is non-fatal
+            log.warning(
+                "write_automation: reload after write failed (automation still saved): "
+                "%s: %s", type(exc).__name__, exc,
+            )
+
+    async def _handle_delete_automation(self, command: dict[str, Any]) -> None:
+        """Delete an automation config IN-PROCESS via HA's config automation
+        StorageCollection.
+
+        This is the FOURTH iEMS write INTO HA (contracts/mqtt_topics.md v0.4.2,
+        GitHub #29).  Same storage path as write_automation: no external WS
+        round-trip, no auth token required.
+
+        After the delete the automation component is reloaded so the change
+        takes effect immediately.
+
+        If the automation id does not exist (stale cloud-side list, already
+        deleted, or no automations configured) the command is a no-op — logged
+        at INFO level, no error raised.  A stale cloud entry MUST NOT kill the
+        subscribe callback.
+
+        Validation (strict, BEFORE the delete):
+          - 'id' must be a non-empty string.
+          - hass must be wired.
+
+        A storage-layer failure is caught and re-wrapped as InvalidCommandError
+        so the callback can log + drop it; the subscribe callback never crashes.
+        """
+        automation_id = command.get("id")
+
+        if not isinstance(automation_id, str) or not automation_id.strip():
+            raise InvalidCommandError(
+                "delete_automation missing/invalid 'id'"
+            )
+        if self._hass is None:
+            raise InvalidCommandError(
+                "delete_automation received but no hass is wired"
+            )
+
+        # Access HA's config automation StorageCollection IN-PROCESS.
+        collection = (
+            self._hass.data.get("automation_config")
+            if hasattr(self._hass, "data")
+            else None
+        )
+        if collection is None:
+            raise InvalidCommandError(
+                "delete_automation: automation_config storage not available in hass.data"
+            )
+
+        # Check existence before attempting delete.  An unknown id is a no-op
+        # (logged, never raised) — a stale cloud list must not crash the callback.
+        existing_ids = (
+            set(collection.async_items().keys())
+            if hasattr(collection, "async_items")
+            else set()
+        )
+        if automation_id not in existing_ids:
+            log.info(
+                "delete_automation: id %r not found — no-op (stale cloud reference?)",
+                automation_id,
+            )
+            return
+
+        try:
+            await collection.async_delete_item(automation_id)
+        except Exception as exc:  # noqa: BLE001 — HA storage errors vary by version
+            raise InvalidCommandError(
+                f"delete_automation: storage delete failed for {automation_id!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        log.info("delete_automation: removed automation %r", automation_id)
+
+        # Reload the automation component so the deletion takes effect now.
+        # Best-effort: a reload failure is logged but MUST NOT crash the callback.
+        try:
+            await self._hass.services.call(
+                "automation", "reload", blocking=True
+            )
+        except Exception as exc:  # noqa: BLE001 — reload failure is non-fatal
+            log.warning(
+                "delete_automation: reload after delete failed (automation still removed): "
+                "%s: %s", type(exc).__name__, exc,
+            )
 
     async def on_message(self, raw: bytes | str | dict) -> bool:
         """awscrt-callback-facing entry point: decode + dispatch, never raises.
