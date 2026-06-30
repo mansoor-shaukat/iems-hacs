@@ -119,12 +119,32 @@ def _build_entity_index(hass) -> dict[str, dict[str, Any]]:
         area = ar_reg.async_get_area(area_id) if area_id else None
         brand = device.manufacturer if device else None
 
+        # v0.5.7 — friendly_name from state attributes (Bug 1 fix).
+        # For MQTT-discovery entities (e.g. MTronic, Solarman), ent.name and
+        # ent.original_name are empty/None — the entity registry never receives
+        # the human-friendly label; that label lives ONLY in the state
+        # attributes under "friendly_name". The old fallback to ent.entity_id
+        # shipped entity_registry entries with the cryptic id as the name
+        # ("light.reserve" instead of "Lobby lamp"). Priority:
+        #   1. state attributes "friendly_name" (the source HA itself uses)
+        #   2. entity registry name (ent.name or ent.original_name)
+        #   3. None — NEVER fall back to entity_id. A null name is correct for
+        #      a truly-unnamed entity; the AI just won't match it by name.
+        state_obj = hass.states.get(ent.entity_id)
+        state_friendly_name = None
+        if state_obj is not None:
+            try:
+                state_friendly_name = state_obj.attributes.get("friendly_name") or None
+            except Exception:  # noqa: BLE001 — never kill the index on a bad state read
+                pass
+        friendly_name = state_friendly_name or ent.name or ent.original_name or None
+
         index[ent.entity_id] = {
             "platform": ent.platform,
             "domain": ent.domain,
             "device_class": ent.device_class or ent.original_device_class,
             "unit": ent.unit_of_measurement,
-            "name": ent.name or ent.original_name or ent.entity_id,
+            "name": friendly_name,
             "area": area.name if area else None,
             "brand": brand,
             "consumer_device": bool(ent.device_id and ent.device_id in consumer_dev_ids),

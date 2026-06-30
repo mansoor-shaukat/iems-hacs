@@ -211,7 +211,21 @@ DOMAIN = "iems"
 # No new MQTT topic, no IAM change, no telemetry wire-shape change, no
 # SCHEMA_VERSION change (field is optional/additive per the v0.15.0 contract).
 # Capped at 500 entries with a loud log on truncation.
-VERSION = "0.5.6"
+# v0.5.7 (2026-06-30): entity_registry[] TWO-BUG FIX.
+# Bug 1 — friendly_name was the entity_id, not the real name. For
+# MQTT-discovery entities (MTronic, Solarman, etc.) ent.name and
+# ent.original_name are empty/None; the human label lives ONLY in HA state
+# attributes under "friendly_name". _build_entity_index now reads
+# hass.states.get(entity_id).attributes.get("friendly_name") FIRST, then
+# falls back to ent.name/ent.original_name, then None (never entity_id).
+# Bug 2 — number/select config knobs flooded the 500-entry cap, evicting
+# real devices (switch.sp_146 "study lamp" was cut). The sort key in
+# _build_entity_registry now uses a domain-tier: real device domains
+# (light/switch/fan/cover/climate/lock/media_player/vacuum/humidifier/
+# water_heater/scene/script) sort BEFORE config knobs (number/select/button/
+# input_*), so the 500-entry cap always keeps real devices first.
+# No new MQTT topic, no IAM change, no telemetry/SCHEMA_VERSION change.
+VERSION = "0.5.7"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"

@@ -194,6 +194,65 @@ _CONTROLLABLE_DOMAINS: frozenset[str] = frozenset(
     }
 )
 
+# v0.5.7 — Domain priority tiers for the _MAX_ENTITY_REGISTRY cap (Bug 2 fix).
+#
+# The live v0.5.6 snapshot had 241 `number` + 83 `select` config knobs in its
+# 500-entry cap, leaving NO room for lights/switches (switch.sp_146 got evicted).
+# The cap must keep REAL DEVICE domains first so the AI-builder always has the
+# actionable entities it was built for.
+#
+# Tier 0 (lowest sort value → highest priority):
+#   Real device domains the AI directly acts on (lights, switches, climate, …).
+#   These represent physical things the user names and talks about ("lobby lamp",
+#   "master AC", "bedroom fan"). Sorted here FIRST so they survive the cap.
+#
+# Tier 1 (higher sort value → lower priority):
+#   Config/helper knobs (number, select, button, input_*) — HA-UI config
+#   sliders/dropdowns, not physical devices. The AI rarely needs to reference
+#   these by name; they land in the cap AFTER real devices.
+#
+# Non-controllable named entities (binary_sensor.front_door, etc.) that pass
+# the has_friendly_name filter share Tier 0 so a named door sensor isn't
+# buried below 241 number knobs.
+_REAL_DEVICE_DOMAINS: frozenset[str] = frozenset(
+    {
+        "light",
+        "switch",
+        "fan",
+        "cover",
+        "climate",
+        "lock",
+        "media_player",
+        "vacuum",
+        "humidifier",
+        "water_heater",
+        "scene",
+        "script",
+    }
+)
+_CONFIG_KNOB_DOMAINS: frozenset[str] = frozenset(
+    {
+        "input_boolean",
+        "input_number",
+        "input_select",
+        "button",
+        "number",
+        "select",
+    }
+)
+
+
+def _domain_tier(domain: str) -> int:
+    """Return the sort tier for a domain: 0 = real device (highest priority),
+    1 = config knob (lowest priority). Used by _build_entity_registry to ensure
+    lights/switches/climate survive the _MAX_ENTITY_REGISTRY cap before
+    number/select config knobs.
+    """
+    if domain in _CONFIG_KNOB_DOMAINS:
+        return 1
+    return 0
+
+
 # Hard ceiling on entity_registry[] entries to stay under the 128 KiB IoT
 # limit. Matches _MAX_AUTOMATIONS intent; see SIZING comment above. Dropped
 # entries are logged loudly — never silently truncated.
@@ -225,9 +284,17 @@ def _build_entity_registry(
                     current production path). See __init__._build_entity_index.
       domain      — entity_id.split(".")[0]
 
-    Sorting: prefer entries WITH a friendly_name first (the AI needs them
-    most), then sort by entity_id for determinism within each group. Capped
-    at _MAX_ENTITY_REGISTRY with a loud log on truncation.
+    Sorting (v0.5.7 — three-level key, Bug 2 fix):
+      1. Domain tier: real device domains (light/switch/fan/cover/climate/lock/
+         media_player/vacuum/humidifier/water_heater/scene/script) sort BEFORE
+         config knobs (number/select/button/input_*). This ensures that when the
+         500-entry cap truncates, real user-facing devices survive and config
+         sliders are the ones dropped. In v0.5.6 the live snapshot contained 241
+         `number` + 83 `select` knobs and ZERO `switch` — switch.sp_146 ("study
+         lamp") was evicted by the cap.
+      2. Within each tier: named entries (friendly_name not None) before unnamed
+         (the AI needs names most).
+      3. Within each (tier, named/unnamed) group: entity_id for determinism.
 
     `entity_index` None (no index supplied) → empty list (back-compat).
     """
@@ -260,9 +327,11 @@ def _build_entity_registry(
             }
         )
 
-    # Sort: friendly_name entries first (cloud AI benefits most from names),
-    # then by entity_id for determinism.
-    entries.sort(key=lambda e: (e["friendly_name"] is None, e["entity_id"]))
+    # Sort: (domain_tier, unnamed_first, entity_id) — real devices before config
+    # knobs, named before unnamed within each tier, entity_id for determinism.
+    entries.sort(
+        key=lambda e: (_domain_tier(e["domain"]), e["friendly_name"] is None, e["entity_id"])
+    )
 
     if len(entries) > _MAX_ENTITY_REGISTRY:
         dropped = len(entries) - _MAX_ENTITY_REGISTRY
