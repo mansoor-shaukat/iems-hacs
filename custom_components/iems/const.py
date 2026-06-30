@@ -225,7 +225,28 @@ DOMAIN = "iems"
 # water_heater/scene/script) sort BEFORE config knobs (number/select/button/
 # input_*), so the 500-entry cap always keeps real devices first.
 # No new MQTT topic, no IAM change, no telemetry/SCHEMA_VERSION change.
-VERSION = "0.5.9"
+# v0.5.10 (2026-06-30): write_automation / delete_automation P0 — the AI-builder
+# write path NEVER reached HA. The v0.4.2–v0.5.9 handlers wrote via
+# hass.data["automation_config"].async_create_item/async_update_item/
+# async_delete_item — but "automation_config" is NOT a key any Home Assistant
+# core component sets (verified by full-source grep inside a running real HA).
+# It is always None, so every write_automation raised "automation_config storage
+# not available", on_message logged + dropped it, and the AI-built automation was
+# silently never written (the assistant still said "done" because the cloud only
+# acked the MQTT publish). Mock-only unit tests fabricated a fake collection on
+# hass.data and hid this for 5 releases (mock-passes-prod-fails family).
+# Fix: both handlers now mutate HA's REAL editable-automation store —
+# automations.yaml (hass.config.path(AUTOMATION_CONFIG_PATH)), an id-keyed list,
+# validated via homeassistant.components.automation.config.async_validate_config_item,
+# upserted/removed by id, written atomically on the executor, then
+# automation.reload {id} — mirroring HA core's EditAutomationConfigView. Delete
+# also drops the orphaned automation entity from the entity registry. After a
+# successful write/delete, HACS re-publishes a setup snapshot so the portal Smart
+# Home card (which reads cached setup_snapshot.automations) reflects the change.
+# Proven against the running iems-staging-ha real HA (the automation appears as a
+# live automation.<slug> entity after the in-handler reload). No new MQTT topic,
+# no IAM change, no telemetry wire-shape / SCHEMA_VERSION change.
+VERSION = "0.5.10"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"

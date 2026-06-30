@@ -29,13 +29,13 @@ subscribe callback and the coordinator/snapshot FSM:
 
     {"action": "write_automation", "automation_id": "<iems_id>",
      "draft_token": "<uuid>", "automation": {...full HA config...}}
-        -> hass.data["automation_config"].async_update_item(id, config)
-           or async_create_item(config) if not found, then automation.reload
-           Idempotent on draft_token: duplicate token → log + no-op.
+        -> upsert-by-id into automations.yaml (HA's editable-automation store),
+           then automation.reload {id}.  Idempotent on draft_token:
+           duplicate token → log + no-op.
 
     {"action": "delete_automation", "id": "<ha_automation_id>"}
-        -> hass.data["automation_config"].async_delete_item(id)
-           then automation.reload. Unknown id → log + no-op.
+        -> remove-by-id from automations.yaml + drop the automation entity from
+           the entity registry, then automation.reload.  Unknown id → log + no-op.
 
 `rename_device` (contracts/mqtt_topics.md v0.4.0) is the FIRST iEMS write INTO
 HA.  HACS runs inside HA, so it applies the label change in-process via the
@@ -55,14 +55,27 @@ If no automation matches the id, the command is logged and dropped as
 automation_not_found; the subscribe callback never crashes.
 
 `write_automation` + `delete_automation` (contracts/mqtt_topics.md v0.4.2,
-GitHub #24 + #29) are the THIRD and FOURTH iEMS writes INTO HA.  Both use
-HA's config automation StorageCollection (hass.data["automation_config"]) — the
-same storage HA's own Lovelace automation editor uses.  `write_automation` is
-idempotent on draft_token: the CommandHandler maintains a per-instance set of
-seen tokens; a duplicate token is logged and dropped without a second write.
-The cloud stamps variables.iems_authored + an iems_ id prefix — HACS preserves
-both so the setup snapshot's _resolve_author correctly labels these "iems".
-`delete_automation` is a no-op for unknown ids (logged, never crashes).
+GitHub #24 + #29) are the THIRD and FOURTH iEMS writes INTO HA.  Both mutate
+the SAME store HA's own Lovelace automation editor uses — the `automations.yaml`
+config file (`hass.config.path(AUTOMATION_CONFIG_PATH)`), an id-keyed list of
+automation configs — then call `automation.reload {id}` so the change takes
+effect immediately.  This mirrors HA core's `EditAutomationConfigView`
+(homeassistant/components/config/automation.py + .../view.py) exactly: read the
+list, validate via `async_validate_config_item`, upsert/remove by `id`, write
+atomically on the executor, then reload.  There is NO `hass.data["automation_config"]`
+object in real Home Assistant — the v0.4.2–v0.5.9 handlers wrote against a
+fabricated key that is `None` in a live HA, so every AI-built automation was
+silently dropped (verified against the running `iems-staging-ha`).  v0.5.10 is
+that fix.  `write_automation` is idempotent on draft_token: the CommandHandler
+maintains a per-instance set of seen tokens; a duplicate token is logged and
+dropped without a second write.  The cloud stamps variables.iems_authored + an
+iems_ id prefix — HACS preserves both so the setup snapshot's _resolve_author
+correctly labels these "iems".  `delete_automation` is a no-op for unknown ids
+(logged, never crashes) and also removes the stale automation entity from the
+entity registry (matching HA's own delete hook).  After a successful write or
+delete, HACS re-publishes a setup snapshot so the portal Smart Home card —
+which reads the cached `PROFILE#SITE_MODEL.setup_snapshot.automations` — reflects
+the change (the post-reload re-snapshot reads the freshly-loaded automation).
 
 Design — pure decode + thin dispatch
 ------------------------------------
@@ -92,9 +105,105 @@ from .const import (
 
 log = logging.getLogger("iems.command_handler")
 
+# The automation config's stable-id key in an automations.yaml entry. HA core
+# uses homeassistant.const.CONF_ID == "id"; we hardcode the literal here so this
+# module is importable in unit tests without a live HA on the path (homeassistant
+# is only importable inside a running HA). The two MUST stay equal — the
+# real-HA integration test (test_command_handler_real_ha.py) asserts the live
+# CONF_ID is "id", pinning this assumption.
+_CONF_ID = "id"
+
 
 class InvalidCommandError(ValueError):
     """Raised when a command payload is malformed, unknown, or un-dispatchable."""
+
+
+def _read_automations_yaml(path: str) -> list[dict[str, Any]]:
+    """Read automations.yaml into an id-keyed list. Runs on the executor.
+
+    Mirrors HA core view.py:_read — returns [] when the file is absent or empty.
+    Uses HA's own YAML loader (homeassistant.util.yaml.load_yaml) so secrets /
+    !include directives parse identically to HA's editor. Imported locally so
+    this module stays importable in unit tests without HA on the path.
+    """
+    import os
+
+    from homeassistant.util.yaml import load_yaml
+
+    if not os.path.isfile(path):
+        return []
+    current = load_yaml(path)
+    if not current:
+        return []
+    if not isinstance(current, list):
+        # An automations.yaml that isn't a list is malformed for the editable
+        # store; HA's EditIdBasedConfigView assumes a list. Fail loud rather
+        # than silently clobbering an unexpected shape.
+        raise ValueError(
+            f"automations.yaml is not a list (got {type(current).__name__}); "
+            "refusing to write"
+        )
+    return current
+
+
+def _write_automations_yaml(path: str, data: list[dict[str, Any]]) -> None:
+    """Write the id-keyed automation list back to automations.yaml atomically.
+
+    Mirrors HA core view.py:_write — dump via homeassistant.util.yaml.dump
+    BEFORE opening the file (so a dump error can't truncate the existing file),
+    then write_utf8_file_atomic. Runs on the executor.
+    """
+    from homeassistant.util.file import write_utf8_file_atomic
+    from homeassistant.util.yaml import dump
+
+    contents = dump(data)
+    write_utf8_file_atomic(path, contents)
+
+
+def _upsert_automation_in_list(
+    automations: list[dict[str, Any]], automation_id: str, config: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Pure upsert-by-id into HA's id-keyed automation list.
+
+    Mirrors `EditAutomationConfigView._write_value`: if an entry with
+    `id == automation_id` exists, it is REPLACED with `config` (with the id
+    forced to match); otherwise `config` is appended. The returned list is a
+    new list (inputs are not mutated) so this stays pure + unit-testable
+    without a live HA. `config`'s own `id` is normalised to `automation_id` so
+    the stored entry is always self-consistent.
+    """
+    normalised = dict(config)
+    normalised[_CONF_ID] = automation_id
+    out: list[dict[str, Any]] = []
+    replaced = False
+    for entry in automations:
+        if isinstance(entry, dict) and entry.get(_CONF_ID) == automation_id:
+            out.append(normalised)
+            replaced = True
+        else:
+            out.append(entry)
+    if not replaced:
+        out.append(normalised)
+    return out
+
+
+def _remove_automation_from_list(
+    automations: list[dict[str, Any]], automation_id: str
+) -> tuple[list[dict[str, Any]], bool]:
+    """Pure remove-by-id from HA's id-keyed automation list.
+
+    Returns `(new_list, removed)`. `removed` is False when no entry matched
+    (the caller treats that as a logged no-op — a stale cloud id must never
+    crash the callback). Inputs are not mutated.
+    """
+    out: list[dict[str, Any]] = []
+    removed = False
+    for entry in automations:
+        if isinstance(entry, dict) and entry.get(_CONF_ID) == automation_id:
+            removed = True
+            continue
+        out.append(entry)
+    return out, removed
 
 
 def decode_command(raw: bytes | str | dict) -> dict[str, Any]:
@@ -416,17 +525,23 @@ class CommandHandler:
         return None
 
     async def _handle_write_automation(self, command: dict[str, Any]) -> None:
-        """Write (create or update) an automation config IN-PROCESS via HA's
-        config automation StorageCollection.
+        """Write (create or update) an automation IN-PROCESS via HA's real
+        editable-automation store (`automations.yaml`).
 
         This is the THIRD iEMS write INTO HA (contracts/mqtt_topics.md v0.4.2,
-        GitHub #24).  HACS runs inside HA — the automation config StorageCollection
-        at hass.data["automation_config"] is the same storage HA's Lovelace
-        automation editor uses; no external WS round-trip, no auth token required.
+        GitHub #24). HACS runs inside HA, so we mutate the same `automations.yaml`
+        store HA's own Lovelace automation editor mutates — read the id-keyed
+        list, validate the new config, upsert by `id`, write it back atomically
+        on the executor, then `automation.reload {id}`. This mirrors HA core's
+        `EditAutomationConfigView` (homeassistant/components/config/automation.py
+        + .../view.py). NO external WS round-trip, no auth token, no fabricated
+        `hass.data["automation_config"]` object (that key does not exist in a
+        live HA — it was the v0.4.2–v0.5.9 silent-drop bug).
 
         After the write the automation component is reloaded via
-        hass.services.call("automation", "reload") so the change takes effect
-        immediately.
+        `hass.services.async_call("automation", "reload", {"id": automation_id})`
+        so the change takes effect immediately, and a fresh setup snapshot is
+        published so the portal Smart Home card reflects the new automation.
 
         The cloud stamps variables.iems_authored: true AND prefixes the
         automation id with "iems_" — HACS preserves both unchanged so the
@@ -434,8 +549,8 @@ class CommandHandler:
 
         Idempotency on draft_token
         --------------------------
-        The cloud may re-deliver a command if the HACS ack was lost.  The
-        CommandHandler maintains a per-instance set (_seen_draft_tokens).  A
+        The cloud may re-deliver a command if the HACS ack was lost. The
+        CommandHandler maintains a per-instance set (_seen_draft_tokens). A
         duplicate draft_token is logged and dropped without a second write —
         the automation config is already in place.
 
@@ -445,9 +560,9 @@ class CommandHandler:
           - 'draft_token' must be a non-empty string.
           - hass must be wired.
 
-        A storage-layer failure (e.g. malformed config rejected by HA) is
-        caught and re-wrapped as InvalidCommandError so the callback can log +
-        drop it; the subscribe callback never crashes.
+        A store/validation failure (e.g. malformed config rejected by HA's
+        config validator) is caught and re-wrapped as InvalidCommandError so the
+        callback can log + drop it; the subscribe callback never crashes.
         """
         automation_id = command.get("automation_id")
         automation_cfg = command.get("automation")
@@ -479,85 +594,149 @@ class CommandHandler:
             )
             return
 
-        # Access HA's config automation StorageCollection IN-PROCESS.
-        # hass.data["automation_config"] is the StorageCollection used by HA's
-        # own Lovelace automation editor (homeassistant.components.config.automation).
-        # It exposes async_update_item(id, data) and async_create_item(data).
-        collection = (
-            self._hass.data.get("automation_config")
-            if hasattr(self._hass, "data")
-            else None
-        )
-        if collection is None:
-            raise InvalidCommandError(
-                "write_automation: automation_config storage not available in hass.data"
-            )
-
         try:
-            # Try update first (idempotent for existing automations).  If the
-            # automation doesn't exist yet, fall through to create.
-            existing_ids = (
-                set(collection.async_items().keys())
-                if hasattr(collection, "async_items")
-                else set()
+            # Validate the config the same way HA's editor does, then upsert it
+            # into automations.yaml on the executor (file IO must not block the
+            # event loop). _store_write_automation does the full read→validate→
+            # upsert→write sequence and returns "created" / "updated".
+            outcome = await self._store_write_automation(
+                automation_id, automation_cfg
             )
-            if automation_id in existing_ids:
-                await collection.async_update_item(automation_id, automation_cfg)
-                log.info(
-                    "write_automation: updated automation %r (draft_token=%r)",
-                    automation_id, draft_token,
-                )
-            else:
-                await collection.async_create_item(automation_cfg)
-                log.info(
-                    "write_automation: created automation %r (draft_token=%r)",
-                    automation_id, draft_token,
-                )
-        except Exception as exc:  # noqa: BLE001 — HA storage errors vary by version
+        except InvalidCommandError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — HA store/validation vary by version
             raise InvalidCommandError(
-                f"write_automation: storage write failed for {automation_id!r}: "
+                f"write_automation: store write failed for {automation_id!r}: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
 
-        # Mark token AFTER a successful write so a storage failure on the first
+        log.info(
+            "write_automation: %s automation %r (draft_token=%r)",
+            outcome, automation_id, draft_token,
+        )
+
+        # Mark token AFTER a successful write so a store failure on the first
         # attempt doesn't lock out a legitimate retry.
         self._seen_draft_tokens.add(draft_token)
 
-        # Reload the automation component so the new config takes effect now
-        # (not only on the next HA restart).  Best-effort: a reload failure is
-        # logged but MUST NOT un-do the write or crash the callback.
+        # Reload the automation component (keyed on this id, matching HA's own
+        # post_write_hook) so the new config takes effect now. Best-effort: a
+        # reload failure is logged but MUST NOT un-do the write or crash the
+        # callback.
+        await self._reload_automation(automation_id)
+
+        # Re-publish a setup snapshot so the portal Smart Home card (which reads
+        # the cached setup_snapshot.automations) reflects the new automation.
+        # Best-effort — a snapshot failure must never crash the callback.
+        await self._resnapshot_after_apply("write_automation")
+
+    async def _store_write_automation(
+        self, automation_id: str, automation_cfg: dict[str, Any]
+    ) -> str:
+        """Validate + upsert an automation into automations.yaml. Returns
+        'created' or 'updated'.
+
+        Mirrors `EditAutomationConfigView.post`:
+          1. validate via homeassistant.components.automation.config.
+             async_validate_config_item (raises vol.Invalid / HomeAssistantError
+             on a malformed config);
+          2. read the current id-keyed list from automations.yaml (executor);
+          3. upsert by id (pure helper);
+          4. write the list back atomically (executor).
+
+        homeassistant is imported locally — it is only importable inside a
+        running HA, so this keeps the module unit-testable without HA on the
+        path.
+        """
+        from homeassistant.components.automation.config import (
+            async_validate_config_item,
+        )
+        from homeassistant.config import AUTOMATION_CONFIG_PATH
+
+        # Validate before touching the file — a bad config must not corrupt the
+        # store. async_validate_config_item raises on malformed input.
+        await async_validate_config_item(self._hass, automation_id, automation_cfg)
+
+        path = self._hass.config.path(AUTOMATION_CONFIG_PATH)
+        current = await self._hass.async_add_executor_job(_read_automations_yaml, path)
+        existed = any(
+            isinstance(e, dict) and e.get(_CONF_ID) == automation_id for e in current
+        )
+        updated_list = _upsert_automation_in_list(
+            current, automation_id, automation_cfg
+        )
+        await self._hass.async_add_executor_job(
+            _write_automations_yaml, path, updated_list
+        )
+        return "updated" if existed else "created"
+
+    async def _reload_automation(self, automation_id: str | None = None) -> None:
+        """Call automation.reload (best-effort). Never raises.
+
+        Passes the automation `id` in the service data, matching HA's own
+        post_write_hook so the reload is scoped to the changed automation. A
+        reload failure is logged but MUST NOT crash the callback or un-do the
+        store write.
+        """
+        service_data = {_CONF_ID: automation_id} if automation_id else None
         try:
-            await self._hass.services.call(
-                "automation", "reload", blocking=True
+            await self._hass.services.async_call(
+                "automation", "reload", service_data, blocking=True
             )
         except Exception as exc:  # noqa: BLE001 — reload failure is non-fatal
             log.warning(
-                "write_automation: reload after write failed (automation still saved): "
-                "%s: %s", type(exc).__name__, exc,
+                "automation reload failed (config still saved): %s: %s",
+                type(exc).__name__, exc,
+            )
+
+    async def _resnapshot_after_apply(self, origin: str) -> None:
+        """Re-publish a setup snapshot after a successful write/delete so the
+        portal Smart Home card reflects the change. Never raises.
+
+        The card reads the cached `PROFILE#SITE_MODEL.setup_snapshot.automations`;
+        nothing else re-snapshots after an apply, so without this the new
+        automation never appears on the card. The snapshot's
+        `_extract_automations` reads the live loaded automation EntityComponent,
+        so this re-snapshot (taken AFTER the reload above) includes the change.
+        Best-effort — a snapshot manager that isn't wired, or a publish failure,
+        is logged + swallowed; the subscribe callback must never crash on it.
+        """
+        mgr = self._snapshot_manager
+        take = getattr(mgr, "handle_take_setup_snapshot_command", None)
+        if not callable(take):
+            return
+        try:
+            await take()
+            log.info("%s: setup snapshot re-published (card refresh)", origin)
+        except Exception as exc:  # noqa: BLE001 — never break the callback
+            log.warning(
+                "%s: post-apply setup snapshot failed: %s: %s",
+                origin, type(exc).__name__, exc,
             )
 
     async def _handle_delete_automation(self, command: dict[str, Any]) -> None:
-        """Delete an automation config IN-PROCESS via HA's config automation
-        StorageCollection.
+        """Delete an automation IN-PROCESS via HA's real editable-automation
+        store (`automations.yaml`).
 
         This is the FOURTH iEMS write INTO HA (contracts/mqtt_topics.md v0.4.2,
-        GitHub #29).  Same storage path as write_automation: no external WS
-        round-trip, no auth token required.
-
-        After the delete the automation component is reloaded so the change
-        takes effect immediately.
+        GitHub #29). Same store path as write_automation: read the id-keyed list
+        from automations.yaml, remove the entry by `id`, write it back atomically
+        on the executor, drop the now-orphaned automation entity from the entity
+        registry (matching HA core's ACTION_DELETE post_write_hook), then
+        `automation.reload`. No external WS round-trip, no auth token, no
+        fabricated `hass.data["automation_config"]` object.
 
         If the automation id does not exist (stale cloud-side list, already
         deleted, or no automations configured) the command is a no-op — logged
-        at INFO level, no error raised.  A stale cloud entry MUST NOT kill the
+        at INFO level, no error raised. A stale cloud entry MUST NOT kill the
         subscribe callback.
 
         Validation (strict, BEFORE the delete):
           - 'id' must be a non-empty string.
           - hass must be wired.
 
-        A storage-layer failure is caught and re-wrapped as InvalidCommandError
-        so the callback can log + drop it; the subscribe callback never crashes.
+        A store-layer failure is caught and re-wrapped as InvalidCommandError so
+        the callback can log + drop it; the subscribe callback never crashes.
         """
         automation_id = command.get("id")
 
@@ -570,51 +749,81 @@ class CommandHandler:
                 "delete_automation received but no hass is wired"
             )
 
-        # Access HA's config automation StorageCollection IN-PROCESS.
-        collection = (
-            self._hass.data.get("automation_config")
-            if hasattr(self._hass, "data")
-            else None
-        )
-        if collection is None:
+        try:
+            removed = await self._store_delete_automation(automation_id)
+        except InvalidCommandError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — HA store errors vary by version
             raise InvalidCommandError(
-                "delete_automation: automation_config storage not available in hass.data"
-            )
+                f"delete_automation: store delete failed for {automation_id!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
 
-        # Check existence before attempting delete.  An unknown id is a no-op
-        # (logged, never raised) — a stale cloud list must not crash the callback.
-        existing_ids = (
-            set(collection.async_items().keys())
-            if hasattr(collection, "async_items")
-            else set()
-        )
-        if automation_id not in existing_ids:
+        if not removed:
             log.info(
                 "delete_automation: id %r not found — no-op (stale cloud reference?)",
                 automation_id,
             )
             return
 
-        try:
-            await collection.async_delete_item(automation_id)
-        except Exception as exc:  # noqa: BLE001 — HA storage errors vary by version
-            raise InvalidCommandError(
-                f"delete_automation: storage delete failed for {automation_id!r}: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
-
         log.info("delete_automation: removed automation %r", automation_id)
 
         # Reload the automation component so the deletion takes effect now.
-        # Best-effort: a reload failure is logged but MUST NOT crash the callback.
+        await self._reload_automation(automation_id)
+
+        # Re-publish a setup snapshot so the card drops the removed automation.
+        await self._resnapshot_after_apply("delete_automation")
+
+    async def _store_delete_automation(self, automation_id: str) -> bool:
+        """Remove an automation from automations.yaml + the entity registry.
+
+        Mirrors `EditAutomationConfigView.delete` + the ACTION_DELETE branch of
+        config/automation.py's post_write_hook:
+          1. read the current id-keyed list from automations.yaml (executor);
+          2. remove the entry by id (pure helper) — returns removed=False on an
+             unknown id, which the caller treats as a logged no-op;
+          3. write the list back atomically (executor);
+          4. drop the orphaned automation entity from the entity registry so it
+             doesn't linger as an "unavailable" entity after the reload.
+
+        Returns True if an entry was removed, False if the id was unknown (no
+        file write happens on an unknown id).
+        """
+        from homeassistant.config import AUTOMATION_CONFIG_PATH
+
+        path = self._hass.config.path(AUTOMATION_CONFIG_PATH)
+        current = await self._hass.async_add_executor_job(_read_automations_yaml, path)
+        updated_list, removed = _remove_automation_from_list(current, automation_id)
+        if not removed:
+            return False
+        await self._hass.async_add_executor_job(
+            _write_automations_yaml, path, updated_list
+        )
+        self._remove_automation_entity(automation_id)
+        return True
+
+    def _remove_automation_entity(self, automation_id: str) -> None:
+        """Drop the automation entity for `automation_id` from the entity
+        registry (best-effort, never raises).
+
+        Matches HA core config/automation.py's ACTION_DELETE hook: after the
+        config is gone, the entity_registry entry (unique_id == automation_id
+        under the automation platform) is removed so a stale "unavailable"
+        automation entity doesn't survive the reload.
+        """
         try:
-            await self._hass.services.call(
-                "automation", "reload", blocking=True
+            from homeassistant.helpers import entity_registry as er
+
+            ent_reg = er.async_get(self._hass)
+            entity_id = ent_reg.async_get_entity_id(
+                "automation", "automation", automation_id
             )
-        except Exception as exc:  # noqa: BLE001 — reload failure is non-fatal
+            if entity_id is not None:
+                ent_reg.async_remove(entity_id)
+        except Exception as exc:  # noqa: BLE001 — registry cleanup is best-effort
             log.warning(
-                "delete_automation: reload after delete failed (automation still removed): "
-                "%s: %s", type(exc).__name__, exc,
+                "delete_automation: entity-registry cleanup for %r failed: %s: %s",
+                automation_id, type(exc).__name__, exc,
             )
 
     async def on_message(self, raw: bytes | str | dict) -> bool:
