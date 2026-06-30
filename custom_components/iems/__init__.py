@@ -287,17 +287,25 @@ if _HA_AVAILABLE:
         # this one; this dispatch only wires the snapshot publish path.
         def _collect(source_kind: str):
             # Returns a coroutine; SetupSnapshotManager awaits awaitable
-            # collectors (see _collect_snapshot). Pass the already-built
-            # entity_index so the snapshot's entity_classifications[] is
-            # classified from the SAME per-entity registry the telemetry
-            # whitelist uses (no second registry walk). Without this, a real
-            # fresh user with no HA Energy Dashboard configured gets an EMPTY
-            # cloud site model (CEO walk, 2026-06-10).
+            # collectors (see _collect_snapshot).
+            #
+            # v0.5.9 — REBUILD the entity index from HA's CURRENT registry on
+            # every snapshot. The boot-time `entity_index` (built at setup, line
+            # ~247) misses entities that register AFTER this integration starts —
+            # e.g. MTronic switches (switch.sp_*) that load progressively. A
+            # rescan (take_setup_snapshot) that replayed the boot index would
+            # silently drop them, so "Scan for new devices" never picked up a
+            # late-loading or newly-added device, and the AI builder couldn't
+            # resolve them by name (e.g. "study lamp" → switch.sp_146; first-run
+            # incident 2026-06-30). Re-reading the registry is a cheap in-memory
+            # walk. The snapshot's entity_classifications[] + entity_registry[]
+            # are both derived from this index, so both go current.
+            fresh_index = _build_entity_index(hass)
             return collect_setup_snapshot(
                 hass,
                 user_id=creds.identity_id,
                 source_kind=source_kind,
-                entity_index=entity_index,
+                entity_index=fresh_index,
             )
 
         snapshot_manager = SetupSnapshotManager(
