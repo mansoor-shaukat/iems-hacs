@@ -211,9 +211,10 @@ _CONTROLLABLE_DOMAINS: frozenset[str] = frozenset(
 #   sliders/dropdowns, not physical devices. The AI rarely needs to reference
 #   these by name; they land in the cap AFTER real devices.
 #
-# Non-controllable named entities (binary_sensor.front_door, etc.) that pass
-# the has_friendly_name filter share Tier 0 so a named door sensor isn't
-# buried below 241 number knobs.
+# Non-controllable named entities (binary_sensor.front_door, sensor.*, etc.)
+# that pass the has_friendly_name filter are Tier 1 — above config knobs but
+# BELOW controllable devices, so hundreds of named sensors can't evict the
+# user's switches/lights from the cap (the v0.5.7 regression, see _domain_tier).
 _REAL_DEVICE_DOMAINS: frozenset[str] = frozenset(
     {
         "light",
@@ -243,14 +244,25 @@ _CONFIG_KNOB_DOMAINS: frozenset[str] = frozenset(
 
 
 def _domain_tier(domain: str) -> int:
-    """Return the sort tier for a domain: 0 = real device (highest priority),
-    1 = config knob (lowest priority). Used by _build_entity_registry to ensure
-    lights/switches/climate survive the _MAX_ENTITY_REGISTRY cap before
-    number/select config knobs.
+    """Return the sort tier for a domain (lower = higher priority) used by
+    _build_entity_registry to decide what survives the _MAX_ENTITY_REGISTRY cap:
+
+      0 = real CONTROLLABLE device (light/switch/fan/cover/climate/...) — what
+          the user names to ACT on; must never be evicted.
+      1 = read-only / other named entity (sensor, binary_sensor, ...) — useful
+          as automation TRIGGERS but secondary to controllable devices.
+      2 = config knob (number/select/button/input_*) — least likely to be named.
+
+    The v0.5.7 bug: sensors shared Tier 0 with real devices, so on a home with
+    hundreds of named sensors (390+) they sorted before "switch.*" alphabetically
+    and ate the entire cap — every switch (incl. "study lamp" switch.sp_146) was
+    dropped. Controllable devices now strictly outrank read-only entities.
     """
+    if domain in _REAL_DEVICE_DOMAINS:
+        return 0
     if domain in _CONFIG_KNOB_DOMAINS:
-        return 1
-    return 0
+        return 2
+    return 1
 
 
 # Hard ceiling on entity_registry[] entries to stay under the 128 KiB IoT

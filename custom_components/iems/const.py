@@ -225,7 +225,7 @@ DOMAIN = "iems"
 # water_heater/scene/script) sort BEFORE config knobs (number/select/button/
 # input_*), so the 500-entry cap always keeps real devices first.
 # No new MQTT topic, no IAM change, no telemetry/SCHEMA_VERSION change.
-VERSION = "0.5.7"
+VERSION = "0.5.8"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"
