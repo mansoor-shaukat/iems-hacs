@@ -197,7 +197,21 @@ DOMAIN = "iems"
 # Payload write: {"action":"write_automation","automation_id":"<iems_id>",
 #                 "draft_token":"<uuid>","automation":{...full HA config...}}
 # Payload delete: {"action":"delete_automation","id":"<ha_automation_id>"}
-VERSION = "0.5.5"
+# v0.5.6 (2026-06-30): HACS setup-snapshot entity_registry[] — Smart Home
+# AI-builder fix (#24 first-run). The cloud AI draft prompt was failing on
+# name-based targets ("lobby lamp") because LATEST# telemetry rows carry no
+# friendly_name and entity_classifications[] is energy-only (no lights/
+# switches). Fix: HACS now includes an entity_registry[] in every setup
+# snapshot: {entity_id, friendly_name, area, domain} for CONTROLLABLE
+# domains (light/switch/fan/cover/climate/scene/script/input_boolean/
+# input_number/input_select/media_player/lock/vacuum/humidifier/water_heater/
+# button/number/select) PLUS any entity carrying a non-empty friendly_name.
+# Friendly name from the coordinator's existing entity_index meta["name"];
+# area from meta["area"] (already resolved to human name by the coordinator).
+# No new MQTT topic, no IAM change, no telemetry wire-shape change, no
+# SCHEMA_VERSION change (field is optional/additive per the v0.15.0 contract).
+# Capped at 500 entries with a loud log on truncation.
+VERSION = "0.5.6"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"

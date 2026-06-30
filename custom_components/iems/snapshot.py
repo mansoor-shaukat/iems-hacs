@@ -7,12 +7,13 @@ install and once per `take_setup_snapshot` command. The cloud receiver Lambda
 writes it onto `PROFILE#SITE_MODEL` with `status='draft'`; Stage-2 (#6) and
 Stage-3 (#8) classifiers consume it from there.
 
-Contract: `contracts/setup_snapshot.schema.json` (rev v0.13.1, CTO-owned,
+Contract: `contracts/setup_snapshot.schema.json` (rev v0.15.0, CTO-owned,
 read-only). NOTE: the contract's `schema_version` *const* is pinned at "0.13.0"
-even though the document revision is v0.13.1 — the v0.13.1 change (the optional
-top-level `entity_classifications[]` field) is ADDITIVE, so a pre-collector
-0.13.0 snapshot still validates. The wire `schema_version` therefore stays
-"0.13.0"; the drift guard enforces it.
+even though the document revision is v0.15.0 — the v0.13.1 change (the optional
+top-level `entity_classifications[]` field), v0.14.0 (the optional
+`automations[]` field), and v0.15.0 (the optional `entity_registry[]` field)
+are all ADDITIVE, so a pre-collector 0.13.0 snapshot still validates. The wire
+`schema_version` therefore stays "0.13.0"; the drift guard enforces it.
 
 Design — pure core + thin impure shell
 --------------------------------------
@@ -132,6 +133,149 @@ _DEVICE_KEYS: tuple[str, ...] = (
 )
 
 _VALID_SOURCE_KINDS = frozenset({"first_install", "rescan"})
+
+# ---------------------------------------------------------------------------
+# entity_registry[] — Smart Home AI-builder (#24), contract v0.15.0
+# ---------------------------------------------------------------------------
+#
+# The AI builder needs a device-name → entity_id index so it can resolve
+# "lobby lamp" → light.reserve without guessing. LATEST# telemetry rows carry
+# NO friendly_name and entity_classifications[] is energy-only (no lights), so
+# without this the AI has zero name signal and every name-based draft fails.
+#
+# We emit ALL CONTROLLABLE DOMAIN entities (the domains the AI can actually
+# act on) PLUS any entity that carries a non-empty friendly_name the user
+# might say — regardless of domain. friendly_name comes from the entity state
+# attributes (HA always populates it) or falls back to the entity registry
+# `name` field; area is resolved to the human area NAME (same resolver the
+# automation collector uses); domain = entity_id.split(".")[0].
+#
+# The set is intentionally BROADER than entity_classifications[] — that set is
+# energy-only (inverter power sensors); this set is controllable+named
+# (lights, switches, fans, locks, climate, media_player ...) with NO energy
+# sensors (they're already in entity_classifications so adding them here would
+# only inflate the snapshot for zero AI benefit). The two sets are
+# complementary and are used by different cloud consumers.
+#
+# SIZING: a controllable entity item is small (~100–150 B): entity_id (~40 B)
+# + friendly_name (~20 B) + area (~15 B) + domain (~10 B) + JSON overhead.
+# Realistic homes: 50–200 controllable entities = ~10–30 KiB. Cap 500 gives
+# 500 × 150 B = 75 KiB worst-case, which combined with the other snapshot
+# sections (device_registry_snapshot ~36 KiB, entity_classifications ~15 KiB,
+# site_config ~1 KiB) lands well under the 80% × 128 KiB ≈ 104 KiB target.
+# Matches _MAX_AUTOMATIONS to signal the same "bounded above real-home ceiling"
+# intent. Dropped entities logged loudly — never silently.
+
+# HA domains whose entities the AI can control. Mirrors the Smart Home domain
+# scope from the product spec. This list is intentionally fixed at the
+# HACS level (controllable at the HA service-call layer); discovery-only
+# domains (sensor / binary_sensor / weather) are excluded — the AI can READ
+# those via the telemetry channel, not WRITE them.
+_CONTROLLABLE_DOMAINS: frozenset[str] = frozenset(
+    {
+        "light",
+        "switch",
+        "fan",
+        "cover",
+        "climate",
+        "scene",
+        "script",
+        "input_boolean",
+        "input_number",
+        "input_select",
+        "media_player",
+        "lock",
+        "vacuum",
+        "humidifier",
+        "water_heater",
+        "button",
+        "number",
+        "select",
+    }
+)
+
+# Hard ceiling on entity_registry[] entries to stay under the 128 KiB IoT
+# limit. Matches _MAX_AUTOMATIONS intent; see SIZING comment above. Dropped
+# entries are logged loudly — never silently truncated.
+_MAX_ENTITY_REGISTRY: int = 500
+
+
+def _build_entity_registry(
+    entity_index: dict[str, dict[str, Any]] | None,
+    area_registry: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Build the entity_registry[] for the AI-builder. PURE.
+
+    Iterates entity_index and emits entries for:
+      - Any entity whose domain is in _CONTROLLABLE_DOMAINS, OR
+      - Any entity carrying a non-empty friendly_name (the words the user
+        would say to the AI, e.g. "lobby lamp") — regardless of domain.
+
+    For each emitted entry:
+      entity_id   — the HA entity_id (key in entity_index)
+      friendly_name — from meta["name"] (the per-entity display name the
+                      coordinator's _build_entity_index pulled from the HA
+                      entity registry or state attributes); nullable.
+      area        — human area NAME resolved from meta["area"]. meta["area"]
+                    is ALREADY the resolved area NAME (not area_id) in the
+                    coordinator's entity_index structure — the coordinator calls
+                    area_registry.areas[area_id].name when it builds the index.
+                    area_registry is accepted here for forward-compatibility but
+                    is NOT used when meta["area"] is already a string (the
+                    current production path). See __init__._build_entity_index.
+      domain      — entity_id.split(".")[0]
+
+    Sorting: prefer entries WITH a friendly_name first (the AI needs them
+    most), then sort by entity_id for determinism within each group. Capped
+    at _MAX_ENTITY_REGISTRY with a loud log on truncation.
+
+    `entity_index` None (no index supplied) → empty list (back-compat).
+    """
+    if not entity_index:
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for entity_id, meta in entity_index.items():
+        domain = entity_id.split(".")[0] if "." in entity_id else entity_id
+        friendly_name = meta.get("name") or None
+        is_controllable = domain in _CONTROLLABLE_DOMAINS
+        has_friendly_name = bool(friendly_name)
+
+        if not is_controllable and not has_friendly_name:
+            # Pure read-only entity with no user-facing name — not useful for
+            # AI name resolution, omit.
+            continue
+
+        # area: meta["area"] is the HUMAN area name in the coordinator's
+        # entity_index (the coordinator resolves area_id → name at index-build
+        # time via __init__._build_entity_index). Coerce empty string → None.
+        area = meta.get("area") or None
+
+        entries.append(
+            {
+                "entity_id": entity_id,
+                "friendly_name": friendly_name,
+                "area": area,
+                "domain": domain,
+            }
+        )
+
+    # Sort: friendly_name entries first (cloud AI benefits most from names),
+    # then by entity_id for determinism.
+    entries.sort(key=lambda e: (e["friendly_name"] is None, e["entity_id"]))
+
+    if len(entries) > _MAX_ENTITY_REGISTRY:
+        dropped = len(entries) - _MAX_ENTITY_REGISTRY
+        log.warning(
+            "setup snapshot: %d entity_registry entries found, capping at %d "
+            "(dropping %d) to stay under the 128 KiB IoT payload limit",
+            len(entries),
+            _MAX_ENTITY_REGISTRY,
+            dropped,
+        )
+        entries = entries[:_MAX_ENTITY_REGISTRY]
+
+    return entries
 
 
 def _project(src: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
@@ -463,6 +607,7 @@ def build_setup_snapshot(
     ts: str,
     entity_index: dict[str, dict[str, Any]] | None = None,
     automations: list[dict[str, Any]] | None = None,
+    entity_registry_index: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build a `setup_snapshot.schema.json`-conforming payload. PURE.
 
@@ -504,6 +649,15 @@ def build_setup_snapshot(
         (omitted) leaves the key ABSENT — a back-compat / pre-Smart-Home path.
         An empty list emits an empty `automations[]` (a home with zero
         automations — distinct from "never collected").
+    entity_registry_index
+        Optional entity_index to build the AI-builder `entity_registry[]`
+        (contract v0.15.0, Smart Home #24). When supplied, _build_entity_registry
+        emits controllable-domain and named entities so the cloud can resolve
+        "lobby lamp" → light.reserve without guessing. The same entity_index
+        dict used for entity_classifications is acceptable here — the builder
+        reads the same meta fields (name, area, domain from entity_id). `None`
+        (omitted) leaves the key ABSENT — a back-compat path for installs that
+        predate Smart Home #24.
 
     Returns
     -------
@@ -555,6 +709,13 @@ def build_setup_snapshot(
     # cloud distinguishes from "never collected").
     if automations is not None:
         snapshot["automations"] = build_automations(automations)
+
+    # entity_registry[] is OPTIONAL + ADDITIVE (contract v0.15.0, Smart Home
+    # #24). Emit ONLY when the caller supplies a registry index. Pre-Smart-Home
+    # installs (or callers that didn't read the entity registry) omit it; the
+    # cloud AI builder degrades to zero name signal in that case.
+    if entity_registry_index is not None:
+        snapshot["entity_registry"] = _build_entity_registry(entity_registry_index)
 
     return snapshot
 
@@ -982,6 +1143,12 @@ async def collect_setup_snapshot(
     threaded into the optional, additive `automations[]` (Smart Home #21/#22).
     The extractor never raises — a home with no automations yields [], and the
     snapshot still publishes.
+
+    The same entity_index is also passed as `entity_registry_index` to build
+    the AI-builder `entity_registry[]` (Smart Home #24, contract v0.15.0):
+    controllable-domain and named entities so the cloud can resolve user
+    device names without guessing. Uses the SAME dict already built — no
+    second registry walk.
     """
     from datetime import datetime, timezone
 
@@ -999,4 +1166,9 @@ async def collect_setup_snapshot(
         ts=ts,
         entity_index=entity_index,
         automations=automations,
+        # entity_registry_index uses the SAME entity_index (the coordinator's
+        # per-entity registry snapshot) — the AI builder needs the same set
+        # of entities the telemetry whitelist knows about: friendly names,
+        # area names, and controllable-domain filtering all live in that dict.
+        entity_registry_index=entity_index,
     )
