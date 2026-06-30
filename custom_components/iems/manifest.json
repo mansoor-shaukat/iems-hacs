@@ -1,7 +1,7 @@
 {
   "domain": "iems",
   "name": "iEMS",
-  "version": "0.5.10",
+  "version": "0.5.11",
   "documentation": "https://github.com/mansoor-shaukat/iems-ha-integration",
   "issue_tracker": "https://github.com/mansoor-shaukat/iems-ha-integration/issues",
   "codeowners": ["@mansoor-shaukat"],

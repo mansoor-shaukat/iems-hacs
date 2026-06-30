@@ -268,14 +268,36 @@ class CommandHandler:
         snapshot_manager,
         recovery_manager=None,
         hass=None,
+        on_self_apply=None,
     ) -> None:
         self._coordinator = coordinator
         self._snapshot_manager = snapshot_manager
         self._recovery_manager = recovery_manager
         self._hass = hass
+        # v0.5.11: optional no-arg callback invoked at the START of an
+        # automation write/delete so the out-of-band AutomationChangeSync
+        # listener suppresses the `automation_reloaded` event OUR own reload
+        # fires (we already re-snapshot in _resnapshot_after_apply — without
+        # suppression the listener would double-snapshot). None when the
+        # auto-sync isn't wired (e.g. unit tests, no-hass handler). Must never
+        # raise into the dispatch path.
+        self._on_self_apply = on_self_apply
         # draft_token idempotency set for write_automation (#24, v0.5.5).
         # Per-instance, non-persistent — see class docstring.
         self._seen_draft_tokens: set[str] = set()
+
+    def _notify_self_apply(self) -> None:
+        """Open the auto-sync suppression window for our own apply. No-op-safe."""
+        cb = self._on_self_apply
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception as exc:  # noqa: BLE001 — suppression must never break apply
+            log.warning(
+                "self-apply suppression hook failed (non-fatal): %s: %s",
+                type(exc).__name__, exc,
+            )
 
     async def handle_command(self, command: dict[str, Any]) -> None:
         """Dispatch a decoded command dict. Raises InvalidCommandError on error."""
@@ -594,6 +616,11 @@ class CommandHandler:
             )
             return
 
+        # Open the auto-sync suppression window BEFORE the store write + reload
+        # so the `automation_reloaded` event our reload fires is ignored by the
+        # out-of-band listener (we re-snapshot explicitly below).
+        self._notify_self_apply()
+
         try:
             # Validate the config the same way HA's editor does, then upsert it
             # into automations.yaml on the executor (file IO must not block the
@@ -748,6 +775,12 @@ class CommandHandler:
             raise InvalidCommandError(
                 "delete_automation received but no hass is wired"
             )
+
+        # Open the auto-sync suppression window BEFORE the store delete +
+        # registry removal + reload so the out-of-band listener ignores the
+        # entity_registry_updated / automation_reloaded events OUR delete fires
+        # (we re-snapshot explicitly below).
+        self._notify_self_apply()
 
         try:
             removed = await self._store_delete_automation(automation_id)

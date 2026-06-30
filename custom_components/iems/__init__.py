@@ -53,11 +53,19 @@ try:
         device_registry as dr,
         entity_registry as er,
     )
-    from homeassistant.helpers.event import async_track_state_change_event
+    from homeassistant.helpers.event import (
+        async_call_later,
+        async_track_state_change_event,
+    )
+    from homeassistant.helpers.entity_registry import (
+        EVENT_ENTITY_REGISTRY_UPDATED,
+    )
+    from homeassistant.components.automation import EVENT_AUTOMATION_RELOADED
     _HA_AVAILABLE = True
 except ImportError:  # pragma: no cover - dev env
     _HA_AVAILABLE = False
 
+from .automation_sync import AutomationChangeSync
 from .command_handler import CommandHandler
 from .config_flow import _is_legacy_unique_id
 from .const import COMMAND_TOPIC_TEMPLATE
@@ -313,6 +321,23 @@ if _HA_AVAILABLE:
             collect=_collect,
         )
 
+        # v0.5.11 — auto-sync the setup snapshot when HA automations change
+        # OUT-OF-BAND (user edits/deletes an automation directly in HA, not via
+        # the iEMS card). The card reads the cached setup_snapshot.automations;
+        # before this, a user-side change wasn't reflected until a rescan or
+        # restart. We listen on HA's two automation-change signals and fire a
+        # DEBOUNCED re-snapshot (coalesces a burst into one publish). The
+        # debounce timer + task scheduler are injected so the core is HA-free
+        # and unit-tested. `suppress()` is handed to the command handler so our
+        # OWN write/delete reload doesn't double-fire (we already re-snapshot in
+        # _resnapshot_after_apply).
+        from functools import partial as _partial
+
+        automation_sync = AutomationChangeSync(
+            trigger=snapshot_manager.handle_take_setup_snapshot_command,
+            schedule_later=_partial(async_call_later, hass),
+        )
+
         # Onboarding v2 (#9, ADR 0005) — shipping-mode command channel.
         # Subscribe to the cloud→HACS command down-topic (QoS 1, persistent
         # session) so the cloud can flip shipping_mode + reconcile the
@@ -342,6 +367,30 @@ if _HA_AVAILABLE:
             # rename_device action applies a label-only device-registry write
             # IN-PROCESS, so the handler needs the HA instance.
             hass=hass,
+            # v0.5.11 — open the auto-sync suppression window around our own
+            # automation write/delete so the reload WE fire doesn't trigger a
+            # second (redundant) snapshot via the out-of-band listener.
+            on_self_apply=automation_sync.suppress,
+        )
+
+        # Register the two HA automation-change listeners. Each returns an
+        # unsub callable; stashed for cleanup on unload. These are pure event-
+        # bus subscriptions (no network, no telemetry side effect).
+        @callback
+        def _on_registry_event(event) -> None:
+            automation_sync.handle_registry_event(
+                event.data.get("action"), event.data.get("entity_id")
+            )
+
+        @callback
+        def _on_automation_reloaded(event) -> None:
+            automation_sync.handle_reload_event()
+
+        _unsub_reg = hass.bus.async_listen(
+            EVENT_ENTITY_REGISTRY_UPDATED, _on_registry_event
+        )
+        _unsub_reload = hass.bus.async_listen(
+            EVENT_AUTOMATION_RELOADED, _on_automation_reloaded
         )
         status_client = HacsStatusClient(api_key=api_key)
         command_topic = COMMAND_TOPIC_TEMPLATE.format(user_id=creds.identity_id)
@@ -481,6 +530,10 @@ if _HA_AVAILABLE:
             "status_client": status_client,
             # Data-recovery (Sprint 7) — recover_window recorder replay.
             "recovery_manager": recovery_manager,
+            # v0.5.11 — out-of-band automation-change auto-sync + its two event
+            # listeners' unsub callables, cleaned up on unload.
+            "automation_sync": automation_sync,
+            "automation_sync_unsubs": [_unsub_reg, _unsub_reload],
         }
         return True
 
@@ -492,6 +545,19 @@ if _HA_AVAILABLE:
         adapter = record.get("adapter")
         auth = record.get("auth")
         edge_poc = record.get("edge_poc")
+        # v0.5.11 — tear down the automation-change listeners + cancel any
+        # pending debounce timer so a config-entry reload doesn't leak them.
+        for unsub in record.get("automation_sync_unsubs", []) or []:
+            try:
+                unsub()
+            except Exception as exc:  # noqa: BLE001 — unload must not raise
+                log.warning(
+                    "iems: automation_sync unsub failed: %s: %s",
+                    type(exc).__name__, exc,
+                )
+        sync = record.get("automation_sync")
+        if sync is not None:
+            sync.cancel()
         if edge_poc:
             edge_poc.stop()
         if coord:

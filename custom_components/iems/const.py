@@ -246,7 +246,26 @@ DOMAIN = "iems"
 # Proven against the running iems-staging-ha real HA (the automation appears as a
 # live automation.<slug> entity after the in-handler reload). No new MQTT topic,
 # no IAM change, no telemetry wire-shape / SCHEMA_VERSION change.
-VERSION = "0.5.10"
+# v0.5.11 (2026-06-30): out-of-band automation auto-sync. The Smart Home card
+# reads cached setup_snapshot.automations; before this, a snapshot only
+# re-published on first-install, a take_setup_snapshot command, and v0.5.10's
+# post-apply re-snapshot — so an automation a user created/edited/DELETED
+# DIRECTLY in HA (UI editor or hand-edited automations.yaml) wasn't reflected on
+# the card until a rescan or restart. New module automation_sync.py listens on
+# HA's two automation-change signals — entity_registry_updated filtered to
+# automation.* (covers UI create/delete: a UI delete removes the entity and does
+# NOT reload, so the registry event is the only delete signal) AND
+# automation_reloaded (covers YAML edits + reloads) — and fires a DEBOUNCED
+# (5s quiet window) setup-snapshot re-publish, coalescing a burst into one
+# publish (no snapshot storm, mindful of the 128 KiB setup-payload limit). The
+# command handler opens a self-apply suppression window around its OWN
+# write/delete so the reload IT fires doesn't double-snapshot on top of
+# _resnapshot_after_apply. Listeners are torn down + the debounce timer
+# cancelled on unload. Proven against the running iems-staging-ha real HA
+# (out-of-band create + delete each fire one re-snapshot; a burst coalesces to
+# one; our own reload is suppressed). No new MQTT topic, no IAM change, no
+# telemetry wire-shape / SCHEMA_VERSION change.
+VERSION = "0.5.11"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"
