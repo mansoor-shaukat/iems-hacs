@@ -433,6 +433,17 @@ class IemsCoordinator:
         #    completed_at}.  Additive + nullable — heartbeat schema unchanged.
         self._last_recovery: dict[str, Any] | None = None
 
+        # ---- v0.5.13 fleet self-update ack (Sprint 7 PoC) ---------------
+        # The most-recent `self_update` outcome, surfaced on the heartbeat so
+        # the cloud learns the command was received/acted on BEFORE the HA
+        # restart tears the connection down.  None until the first
+        # self_update command runs.  Shape per
+        # docs/sprints/sprint_07/fleet_self_update_v0513_spec.md §A:
+        #   {result, from, to, command_id, completed_at, reason?}
+        # result ∈ {noop, self_update_started, error}.  Additive + nullable —
+        # heartbeat schema unchanged (same carriage as last_recovery).
+        self._last_self_update: dict[str, Any] | None = None
+
     # ---------------------- State capture ---------------------------------
 
     def capture_state_change(self, new_state) -> None:
@@ -1023,6 +1034,17 @@ class IemsCoordinator:
         """
         self._last_recovery = ack
 
+    def set_last_self_update(self, ack: dict[str, Any]) -> None:
+        """Stash the most-recent self_update ack for the next heartbeat.
+
+        Called by CommandHandler._handle_self_update (v0.5.13, Sprint 7 fleet
+        self-update PoC).  Pure state write — the value is read by
+        `heartbeat_once` and shipped on the heartbeat's `last_self_update`
+        field, then the handler fires an IMMEDIATE heartbeat so the ack
+        reaches the cloud before the post-install HA restart.
+        """
+        self._last_self_update = ack
+
     def _telemetry_publishing_enabled(self) -> bool:
         """True iff the current shipping mode permits 30s telemetry batches."""
         return self.shipping_mode not in TELEMETRY_SUPPRESSED_MODES
@@ -1231,6 +1253,11 @@ class IemsCoordinator:
             # completes; once set, every heartbeat re-reports the latest
             # outcome so a missed heartbeat doesn't lose the ack.
             last_recovery=self._last_recovery,
+            # v0.5.13 — fleet self-update ack.  None until the first
+            # self_update command runs; once set, every heartbeat re-reports
+            # the latest outcome (the post-restart heartbeat's
+            # integration_version is the ground truth of success).
+            last_self_update=self._last_self_update,
         )
         await self._publisher.publish_heartbeat(hb)
         # Drain any backlogged batches the publisher accumulated while the

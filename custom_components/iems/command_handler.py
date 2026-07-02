@@ -37,6 +37,15 @@ subscribe callback and the coordinator/snapshot FSM:
         -> remove-by-id from automations.yaml + drop the automation entity from
            the entity registry, then automation.reload.  Unknown id → log + no-op.
 
+    {"action": "self_update", "version": "<X.Y.Z>", "command_id": "<id>"}
+        -> refresh the HACS release cache for the iEMS repo ONLY, then
+           update.install pinned to `version` on the iEMS update entity
+           (discovered via the entity registry — never hardcoded), ack
+           `self_update_started {from,to,command_id}` on an immediate
+           heartbeat, then homeassistant.restart.  Requested == running →
+           ack `noop` (idempotent under redelivery).  v0.5.13, DORMANT —
+           no cloud emitter yet.  (any mode)
+
 `rename_device` (contracts/mqtt_topics.md v0.4.0) is the FIRST iEMS write INTO
 HA.  HACS runs inside HA, so it applies the label change in-process via the
 device-registry helper — no external WS round-trip.  It is label-only and
@@ -89,8 +98,11 @@ swallowed by the threadpool anyway, so we log it ourselves for visibility).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import re
+from datetime import datetime, timezone
 from typing import Any
 
 from .const import (
@@ -98,12 +110,26 @@ from .const import (
     COMMAND_ACTION_ENABLE_AUTOMATION,
     COMMAND_ACTION_RECOVER_WINDOW,
     COMMAND_ACTION_RENAME_DEVICE,
+    COMMAND_ACTION_SELF_UPDATE,
     COMMAND_ACTION_SET_SHIPPING_MODE,
     COMMAND_ACTION_TAKE_SETUP_SNAPSHOT,
     COMMAND_ACTION_WRITE_AUTOMATION,
+    IEMS_HACS_REPO_FULL_NAME,
+    SELF_UPDATE_RESTART_DELAY_SECONDS,
+    VERSION,
 )
 
 log = logging.getLogger("iems.command_handler")
+
+# Exact semver pin for self_update — X.Y.Z only.  No "latest", no "v" prefix,
+# no pre-release/build suffixes: the fleet contract (mqtt_topics.md v0.5.0)
+# requires an exact pin so every install (and rollback) is reproducible.
+_SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def _now_iso_z() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 
 # The automation config's stable-id key in an automations.yaml entry. HA core
 # uses homeassistant.const.CONF_ID == "id"; we hardcode the literal here so this
@@ -316,6 +342,8 @@ class CommandHandler:
             await self._handle_write_automation(command)
         elif action == COMMAND_ACTION_DELETE_AUTOMATION:
             await self._handle_delete_automation(command)
+        elif action == COMMAND_ACTION_SELF_UPDATE:
+            await self._handle_self_update(command)
         elif action is None:
             raise InvalidCommandError("command missing 'action'")
         else:
@@ -858,6 +886,358 @@ class CommandHandler:
                 "delete_automation: entity-registry cleanup for %r failed: %s: %s",
                 automation_id, type(exc).__name__, exc,
             )
+
+    # ------------------------------------------------------------------
+    # self_update (v0.5.13 — fleet self-update PoC, mqtt_topics.md v0.5.0)
+    # ------------------------------------------------------------------
+
+    async def _handle_self_update(self, command: dict[str, Any]) -> None:
+        """Update the RUNNING iEMS integration to a pinned version, in-process.
+
+        Spec: docs/sprints/sprint_07/fleet_self_update_v0513_spec.md §A.
+        Payload: {"action": "self_update", "version": "<X.Y.Z>",
+                  "command_id": "<id>"}
+
+        Order of operations (each step's failure acks `error` with a reason
+        on the heartbeat `last_self_update` field — no silent excepts):
+          1. Validate `version` (REQUIRED exact X.Y.Z pin — no "latest").
+          2. No-op guard: requested == running VERSION → ack `noop` and stop.
+             This is the staging liveness probe for the dormant handler AND
+             the idempotency guard for redelivered commands (post-restart,
+             a re-received self_update to the now-running version ends here).
+          3. Refresh the HACS release cache for the iEMS repository ONLY
+             (best-effort — HACS internals absent/changed logs loudly and
+             STILL proceeds; HA may already know the version).
+          4. `update.install` pinned to `version` on the iEMS update entity,
+             discovered via the entity registry by the iEMS repo association
+             (primary) or the update entity's release_url (fallback) — never
+             hardcoded, never taken from the command payload.
+          5. Ack `self_update_started {from, to, command_id}` and flush it on
+             an IMMEDIATE heartbeat (same ack machinery as `last_recovery`).
+          6. `homeassistant.restart` after a short delay so the ack publish
+             clears the socket.  Post-restart ground truth of success is
+             HEARTBEAT.version, not this ack.
+
+        Structural scope: the ONLY selector feeding the repo lookup and the
+        entity discovery is const.IEMS_HACS_REPO_FULL_NAME.  The command
+        payload contributes the version pin and command_id — nothing else —
+        so the handler is structurally unable to install any other
+        repo/entity.
+        """
+        version_raw = command.get("version")
+        command_id_raw = command.get("command_id")
+        # command_id is a correlation passthrough — echo it when it's a
+        # sane string, ack null otherwise (never a validation failure).
+        command_id = (
+            command_id_raw.strip()
+            if isinstance(command_id_raw, str) and command_id_raw.strip()
+            else None
+        )
+
+        if not isinstance(version_raw, str) or not _SEMVER_RE.match(
+            version_raw.strip()
+        ):
+            reason = (
+                "self_update missing/invalid 'version' "
+                f"(exact X.Y.Z pin required): {version_raw!r}"
+            )
+            await self._ack_self_update(
+                "error",
+                to=version_raw if isinstance(version_raw, str) else None,
+                command_id=command_id,
+                reason=reason,
+            )
+            raise InvalidCommandError(reason)
+        version = version_raw.strip()
+
+        # No-op guard — requested version already running.  Doubles as the
+        # staging liveness probe and the redelivery-idempotency guard.
+        if version == VERSION:
+            log.info(
+                "self_update: requested version %s == running version — noop",
+                version,
+            )
+            await self._ack_self_update(
+                "noop", to=version, command_id=command_id
+            )
+            return
+
+        if self._hass is None:
+            reason = "self_update received but no hass is wired"
+            await self._ack_self_update(
+                "error", to=version, command_id=command_id, reason=reason
+            )
+            raise InvalidCommandError(reason)
+
+        # Step 3 — best-effort release-cache refresh (iEMS repo only).  A
+        # failure here logs loudly and NEVER blocks the install attempt.
+        await self._refresh_iems_release_cache()
+
+        # Step 4 — discover the iEMS update entity (never hardcoded).
+        entity_id = self._find_iems_update_entity()
+        if entity_id is None:
+            reason = (
+                "self_update: iEMS update entity not found (registry lookup "
+                f"and release_url fallback both missed for repo "
+                f"{IEMS_HACS_REPO_FULL_NAME!r})"
+            )
+            await self._ack_self_update(
+                "error", to=version, command_id=command_id, reason=reason
+            )
+            raise InvalidCommandError(reason)
+
+        try:
+            await self._hass.services.async_call(
+                "update",
+                "install",
+                {"entity_id": entity_id, "version": version},
+                blocking=True,
+            )
+        except Exception as exc:  # noqa: BLE001 — HA service failures vary widely
+            # Unknown version, HACS download failure, update entity busy —
+            # all surface here.  Ack the reason, and NEVER restart on a
+            # failed install (restarting onto unchanged bytes would only
+            # cause a pointless outage).
+            reason = (
+                f"self_update: update.install failed for {entity_id!r} "
+                f"pin {version}: {type(exc).__name__}: {exc}"
+            )
+            await self._ack_self_update(
+                "error", to=version, command_id=command_id, reason=reason
+            )
+            raise InvalidCommandError(reason) from exc
+
+        log.info(
+            "self_update: update.install %s → %s succeeded on %s — "
+            "acking then restarting HA",
+            VERSION, version, entity_id,
+        )
+
+        # Step 5 — ack BEFORE restart, flushed on an immediate heartbeat.
+        await self._ack_self_update(
+            "self_update_started", to=version, command_id=command_id
+        )
+
+        # Step 6 — restart after a short delay so the ack publish completes.
+        await asyncio.sleep(SELF_UPDATE_RESTART_DELAY_SECONDS)
+        try:
+            await self._hass.services.async_call(
+                "homeassistant", "restart", {}, blocking=False
+            )
+        except Exception as exc:  # noqa: BLE001 — restart failure must be acked
+            # The install DID land; only the restart failed.  Overwrite the
+            # started ack with the truth — the update is staged but not live
+            # until HA restarts (manually, or via a retried command).
+            reason = (
+                "self_update: install succeeded but homeassistant.restart "
+                f"failed: {type(exc).__name__}: {exc}"
+            )
+            await self._ack_self_update(
+                "error", to=version, command_id=command_id, reason=reason
+            )
+            raise InvalidCommandError(reason) from exc
+
+    async def _ack_self_update(
+        self,
+        result: str,
+        *,
+        to: str | None,
+        command_id: str | None,
+        reason: str | None = None,
+    ) -> None:
+        """Store a self_update ack + flush it on an immediate heartbeat.
+
+        Reuses the heartbeat-carried ack machinery (same pattern as
+        `last_recovery` / v0.4.7 immediate heartbeat): the ack is stashed on
+        the coordinator (`set_last_self_update`) so EVERY subsequent
+        heartbeat re-reports it, then `heartbeat_once` fires so the cloud
+        sees it in seconds — critically, BEFORE the post-install HA restart
+        drops the connection.  Never raises: ack plumbing failures are
+        logged, the command outcome is already decided by the caller.
+        """
+        ack: dict[str, Any] = {
+            "result": result,
+            "from": VERSION,
+            "to": to,
+            "command_id": command_id,
+            "completed_at": _now_iso_z(),
+        }
+        if reason is not None:
+            ack["reason"] = str(reason)
+            log.error("self_update ack: %s", reason)
+        store = getattr(self._coordinator, "set_last_self_update", None)
+        if callable(store):
+            try:
+                store(ack)
+            except Exception as exc:  # noqa: BLE001 — never break the callback
+                log.error(
+                    "self_update: failed to store ack: %s: %s",
+                    type(exc).__name__, exc,
+                )
+        else:
+            log.error(
+                "self_update: coordinator has no set_last_self_update — "
+                "ack %r not stored", result,
+            )
+        hb = getattr(self._coordinator, "heartbeat_once", None)
+        if callable(hb):
+            try:
+                await hb()
+            except Exception as exc:  # noqa: BLE001 — never break the callback
+                log.warning(
+                    "self_update: immediate ack heartbeat failed "
+                    "(ack rides the next scheduled tick): %s: %s",
+                    type(exc).__name__, exc,
+                )
+
+    def _get_iems_hacs_repository(self):
+        """Return HACS's repository object for the iEMS repo, or None.
+
+        Reads the `hacs` domain object from hass.data and resolves the
+        repository by IEMS_HACS_REPO_FULL_NAME — the ONLY name this method
+        can ever look up (structural scope).  Every miss returns None with a
+        loud log; HACS internals are third-party and version-drift here must
+        never crash the callback nor block the install attempt.
+        """
+        data = getattr(self._hass, "data", None)
+        get = getattr(data, "get", None)
+        hacs = get("hacs") if callable(get) else None
+        if hacs is None:
+            log.error(
+                "self_update: hass.data['hacs'] unavailable — HACS internals "
+                "absent or renamed; skipping release-cache refresh"
+            )
+            return None
+        repositories = getattr(hacs, "repositories", None)
+        get_by_full_name = getattr(repositories, "get_by_full_name", None)
+        if not callable(get_by_full_name):
+            log.error(
+                "self_update: HACS repositories.get_by_full_name unavailable "
+                "(HACS internals changed?); skipping release-cache refresh"
+            )
+            return None
+        try:
+            repo = get_by_full_name(IEMS_HACS_REPO_FULL_NAME)
+        except (KeyError, AttributeError, TypeError, ValueError) as exc:
+            log.error(
+                "self_update: HACS repository lookup for %r failed: %s: %s",
+                IEMS_HACS_REPO_FULL_NAME, type(exc).__name__, exc,
+            )
+            return None
+        if repo is None:
+            log.error(
+                "self_update: HACS has no repository %r — release-cache "
+                "refresh skipped", IEMS_HACS_REPO_FULL_NAME,
+            )
+        return repo
+
+    async def _refresh_iems_release_cache(self) -> None:
+        """Refresh HACS's release cache for the iEMS repository ONLY.
+
+        In-process equivalent of the `hacs/repository/refresh` WS command:
+        awaits the repository object's `update_repository`.  Strictly
+        best-effort — ANY failure logs loudly and returns, because HA may
+        already know the requested release and `update.install` (step 4)
+        must still be attempted per spec §A step 3.
+        """
+        repo = self._get_iems_hacs_repository()
+        if repo is None:
+            return  # already logged loudly by the lookup
+        update = getattr(repo, "update_repository", None)
+        if not callable(update):
+            log.error(
+                "self_update: HACS repository object has no "
+                "update_repository (HACS internals changed?) — refresh "
+                "skipped, proceeding to install"
+            )
+            return
+        try:
+            # Signature per current HACS (WS handler passes these kwargs);
+            # retried bare on TypeError to survive HACS signature drift.
+            await update(ignore_issues=True, force=True)
+            log.info(
+                "self_update: HACS release cache refreshed for %s",
+                IEMS_HACS_REPO_FULL_NAME,
+            )
+        except TypeError:
+            try:
+                await update()
+                log.info(
+                    "self_update: HACS release cache refreshed for %s "
+                    "(legacy signature)", IEMS_HACS_REPO_FULL_NAME,
+                )
+            except Exception as exc:  # noqa: BLE001 — refresh is best-effort
+                log.error(
+                    "self_update: release-cache refresh failed (legacy "
+                    "signature): %s: %s — proceeding to install",
+                    type(exc).__name__, exc,
+                )
+        except Exception as exc:  # noqa: BLE001 — refresh is best-effort
+            log.error(
+                "self_update: release-cache refresh failed: %s: %s — "
+                "proceeding to install", type(exc).__name__, exc,
+            )
+
+    def _find_iems_update_entity(self) -> str | None:
+        """Discover the iEMS update entity — never hardcoded.
+
+        Primary: entity-registry lookup by the HACS repository association —
+        HACS registers its update entities under platform "hacs" with
+        unique_id == str(repository.data.id), so the iEMS repo object gives
+        us the exact registry key.
+
+        Fallback (HACS internals absent/changed): scan update-domain states
+        for the entity whose `release_url` attribute points at the iEMS
+        GitHub repo (HACS builds release_url from the repo full_name).
+
+        Both paths derive exclusively from IEMS_HACS_REPO_FULL_NAME; the
+        command payload cannot influence the result.  Returns None when
+        neither path finds the entity.
+        """
+        # -- Primary: registry lookup keyed on the HACS repository id.
+        repo = self._get_iems_hacs_repository()
+        if repo is not None:
+            repo_id = getattr(getattr(repo, "data", None), "id", None)
+            if repo_id is not None:
+                try:
+                    from homeassistant.helpers import entity_registry as er
+
+                    ent_reg = er.async_get(self._hass)
+                    entity_id = ent_reg.async_get_entity_id(
+                        "update", "hacs", str(repo_id)
+                    )
+                    if entity_id:
+                        log.info(
+                            "self_update: iEMS update entity %s "
+                            "(registry, repo id %s)", entity_id, repo_id,
+                        )
+                        return entity_id
+                except (ImportError, AttributeError, KeyError) as exc:
+                    log.error(
+                        "self_update: entity-registry lookup failed: %s: %s "
+                        "— trying release_url fallback",
+                        type(exc).__name__, exc,
+                    )
+        # -- Fallback: match the update entity by its release_url.
+        states = getattr(self._hass, "states", None)
+        async_all = getattr(states, "async_all", None)
+        if not callable(async_all):
+            log.error(
+                "self_update: hass.states.async_all unavailable — cannot "
+                "run release_url fallback discovery"
+            )
+            return None
+        needle = f"github.com/{IEMS_HACS_REPO_FULL_NAME}"
+        for state in async_all("update"):
+            attrs = getattr(state, "attributes", None) or {}
+            release_url = attrs.get("release_url")
+            if isinstance(release_url, str) and needle in release_url:
+                log.info(
+                    "self_update: iEMS update entity %s (release_url "
+                    "fallback)", state.entity_id,
+                )
+                return state.entity_id
+        return None
 
     async def on_message(self, raw: bytes | str | dict) -> bool:
         """awscrt-callback-facing entry point: decode + dispatch, never raises.

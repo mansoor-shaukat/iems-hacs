@@ -217,6 +217,7 @@ def build_heartbeat(
     client_error_disconnects: int | None = None,
     last_disconnect_reason: str | None = None,
     last_recovery: dict | None = None,
+    last_self_update: dict | None = None,
 ) -> dict:
     """Heartbeat payload — shape per hacs_spec.md §3f.
 
@@ -289,4 +290,14 @@ def build_heartbeat(
     # otherwise UNCHANGED so older consumers are unaffected).
     if last_recovery is not None:
         payload["last_recovery"] = last_recovery
+    # v0.5.13 (2026-07-02) — fleet self-update ack (Sprint 7 PoC).  Additive +
+    # nullable, same carriage pattern as last_recovery: shape
+    #   {result, from, to, command_id, completed_at, reason?}
+    # where result ∈ {noop, self_update_started, error}.  Emitted only when a
+    # self_update command has run since start-up (None → field omitted, so the
+    # heartbeat schema is otherwise UNCHANGED and older consumers unaffected).
+    # Post-restart ground truth of a completed update is integration_version
+    # (HEARTBEAT.version) above, not this ack.
+    if last_self_update is not None:
+        payload["last_self_update"] = last_self_update
     return payload

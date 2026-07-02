@@ -265,7 +265,7 @@ DOMAIN = "iems"
 # (out-of-band create + delete each fire one re-snapshot; a burst coalesces to
 # one; our own reload is suppressed). No new MQTT topic, no IAM change, no
 # telemetry wire-shape / SCHEMA_VERSION change.
-VERSION = "0.5.12"
+VERSION = "0.5.13"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"
@@ -454,6 +454,35 @@ COMMAND_ACTION_ENABLE_AUTOMATION = "enable_automation"
 # no-op (never crash the callback).
 COMMAND_ACTION_WRITE_AUTOMATION = "write_automation"
 COMMAND_ACTION_DELETE_AUTOMATION = "delete_automation"
+# v0.5.13 (2026-07-02) — Fleet self-update PoC (contracts/mqtt_topics.md
+# v0.5.0, docs/sprints/sprint_07/fleet_self_update_v0513_spec.md §A).
+# Cloud sends self_update on the EXISTING command down-topic; HACS refreshes
+# the HACS release cache for the iEMS repository ONLY, calls update.install
+# pinned to the requested version on the iEMS update entity (discovered via
+# the entity registry by the iEMS repo association — never hardcoded, never
+# taken from the payload), acks `self_update_started {from,to,command_id}` on
+# the heartbeat's nullable `last_self_update` field (same machinery as
+# `last_recovery`), then restarts HA after the ack flushes. `version` is a
+# REQUIRED exact X.Y.Z pin (no "latest"; pinning supports downgrade =
+# rollback). Requested version == running VERSION acks `noop` — the staging
+# liveness probe AND the idempotency-under-redelivery guard. Every failure
+# path acks `error` with a reason. Ships DORMANT in v0.5.13 — no cloud
+# emitter exists yet. No new MQTT topic, no IAM change, no new ingress into
+# HA (CEO route constraint: updates flow through the existing iEMS HACS repo
+# already configured in HA).
+COMMAND_ACTION_SELF_UPDATE = "self_update"
+
+# The ONE repository self_update may ever act on. Structural scope anchor:
+# both the HACS repo lookup (release-cache refresh) and the update-entity
+# discovery derive EXCLUSIVELY from this constant — no field of the command
+# payload can retarget the install to another repo or entity.
+IEMS_HACS_REPO_FULL_NAME = "mansoor-shaukat/iems-hacs"
+
+# Delay between flushing the self_update_started ack heartbeat and calling
+# homeassistant.restart, so the QoS-0 ack publish clears the socket before
+# HA tears the connection down. Post-restart ground truth of success is
+# HEARTBEAT.version — the ack is the "started" signal, not the proof.
+SELF_UPDATE_RESTART_DELAY_SECONDS = 2.0
 
 # Schema — MUST match server-side ingestion validator version
 SCHEMA_VERSION = "0.6.0"
