@@ -265,7 +265,7 @@ DOMAIN = "iems"
 # (out-of-band create + delete each fire one re-snapshot; a burst coalesces to
 # one; our own reload is suppressed). No new MQTT topic, no IAM change, no
 # telemetry wire-shape / SCHEMA_VERSION change.
-VERSION = "0.5.11"
+VERSION = "0.5.12"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"
@@ -537,3 +537,24 @@ HUMIDITY_DELTA_THRESHOLD_PCT = 1.0
 # Δ ≥ 1.0 kWh.  Cumulative counters monotonically increase; 1 kWh is the
 # Sprint-7 reporting granularity for energy widgets.
 ENERGY_DELTA_THRESHOLD_KWH = 1.0
+
+# ---------------------------------------------------------------------------
+# Sprint 7 (2026-07-02) — Autopilot DIAGNOSE opener: inverter fault/alarm
+# ingestion (telemetry.schema.json v0.8.0, send_policy.md v0.3.2, spec at
+# docs/sprints/sprint_07/inverter_fault_ingestion_spec.md).
+#
+# `inverter.fault` is the category for ha-solarman enum sensors reading the
+# Deye Device Fault (Modbus regs 103–106) and Device Alarm (regs 101–102)
+# registers: `sensor.{prefix}_device_fault[_2]` / `sensor.{prefix}_device_alarm[_2]`,
+# device_class=enum.  State is the integration's enum render ('OK' / 'Problem'
+# / named fault string); the diagnostic payload is the `value` attribute — a
+# list of raw register words ([] when OK, e.g. [0,0,0,128] = F56 during the
+# real 2026-06-30 ground-bank trip).  HACS does NOT decode (LD-F1: keep HACS
+# dumb — the F-code table lives cloud-side and stays updatable without a HACS
+# release); it classifies, routes through the latest_only send-policy bucket
+# (LD-F2: enum text changes rarely, a fault IS a state transition), and
+# carries the raw attributes to the wire.  The universal skip-on-unavailable
+# rule applies unchanged: a blackout emits one LATEST# `unavailable`
+# transition; the fault text arrives on the recovery transition.
+# ---------------------------------------------------------------------------
+CATEGORY_INVERTER_FAULT = "inverter.fault"

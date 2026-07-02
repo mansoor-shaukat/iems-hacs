@@ -60,6 +60,7 @@ from typing import Any
 from .classifier import classify
 from .const import (
     BATCH_WINDOW_SECONDS,
+    CATEGORY_INVERTER_FAULT,
     DEFAULT_SHIPPING_MODE,
     ENERGY_DELTA_THRESHOLD_KWH,
     HEARTBEAT_INTERVAL_SECONDS,
@@ -163,6 +164,16 @@ _SEND_POLICY: dict[str, dict[str, Any]] = {
     "light":               {"bucket": "latest_only", "threshold": None},
     "climate":             {"bucket": "latest_only", "threshold": None},
     "other":               {"bucket": "latest_only", "threshold": None},
+    # v0.3.2 (2026-07-02, send_policy.md amendment) — inverter fault/alarm
+    # enum sensors (Autopilot DIAGNOSE opener, telemetry.schema.json v0.8.0).
+    # Enum text states ('OK' / 'Problem' / named fault) change rarely — a
+    # fault IS a state transition, so latest_only is the exact fit and the
+    # state_changed-silence concern does not apply.  The raw register words
+    # MUST ride attributes.value on the transition row (capture attrs pass
+    # through _emit_transition_row unfiltered); the cloud decodes them to
+    # F-codes (LD-F1: HACS stays dumb).  NOT in _NUMERIC_CATEGORIES — the
+    # state stays a string, no accumulator, no TS# rows.
+    CATEGORY_INVERTER_FAULT: {"bucket": "latest_only", "threshold": None},
 }
 
 # Default for any category not explicitly listed (defensive — see comment above).
@@ -336,6 +347,17 @@ class IemsCoordinator:
         # `None` for an entity means "no row has ever been shipped" (first-boot
         # rule: emit unconditionally on first non-unavailable event).
         self._last_emitted_state: dict[str, Any] = {}
+
+        # Sprint 7 (v0.3.2 send-policy) — per-entity last-emitted raw fault
+        # words (`attributes.value`) for inverter.fault entities.  The enum
+        # render collapses 56 of 64 fault bits to the same 'Problem' fallback
+        # string, so two DIFFERENT faults back-to-back (F56 → F41 with no
+        # intervening OK) look like a same-value re-fire to the plain
+        # `_last_emitted_state` dedup.  The register words are the actual
+        # diagnostic payload the cloud decodes — a word change IS a real
+        # transition and must emit.  Only consulted/updated for
+        # CATEGORY_INVERTER_FAULT entities.
+        self._last_emitted_fault_value: dict[str, Any] = {}
 
         # Pending rows queued by the latest-only capture path (switches, lights,
         # climate.mode, text/other).  Drained alongside finalised accumulator
@@ -541,7 +563,19 @@ class IemsCoordinator:
         if bucket == "latest_only":
             prev = self._last_emitted_state.get(entity_id)
             if prev == state:
-                return
+                if category != CATEGORY_INVERTER_FAULT:
+                    return
+                # inverter.fault: the diagnostic payload is the raw register
+                # word list in attributes["value"], and the enum render
+                # collapses most fault bits to the same 'Problem' fallback.
+                # 'Problem' → 'Problem' with CHANGED words (F56 → F41, no
+                # intervening OK) is a REAL fault transition — emit it.
+                # Unchanged words → genuine same-value re-fire → suppress.
+                if (
+                    self._last_emitted_fault_value.get(entity_id)
+                    == (attrs or {}).get("value")
+                ):
+                    return
             self._emit_transition_row(
                 entity_id=entity_id,
                 category=category,
@@ -550,6 +584,10 @@ class IemsCoordinator:
                 attrs=attrs,
                 meta=meta,
             )
+            if category == CATEGORY_INVERTER_FAULT:
+                self._last_emitted_fault_value[entity_id] = (
+                    (attrs or {}).get("value")
+                )
             return
 
         key = (entity_id, minute_iso)

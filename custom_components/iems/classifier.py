@@ -7,6 +7,10 @@ Evaluation order (per hacs_spec.md §3a, approved by Sarah 2026-04-19):
 
   1. Suppression — dedup / platform blacklist / domain blacklist.
   2. Battery SOC detection — BEFORE any inverter.* hint.
+  2b. Inverter fault/alarm enum sensors → inverter.fault (v0.8.0, Sprint 7
+      Autopilot DIAGNOSE opener).  Requires device_class=enum AND a
+      device_fault/device_alarm name/entity_id hint — conservative on
+      purpose so no other enum sensor is swept in.
   3. Inverter.* hints — require entity_id keyword AND a power/energy signal.
   4. Generic sensor.power / sensor.energy by device_class.
   5. meter.energy for remaining electrical device_classes.
@@ -33,6 +37,7 @@ VALID_CATEGORIES: set[str] = {
     "sensor.humidity",
     "light",
     "climate",
+    "inverter.fault",
     "other",
 }
 
@@ -102,6 +107,16 @@ INVERTER_KEYWORDS: dict[str, str] = {
 
 SOC_NAME_HINTS: tuple[str, ...] = ("soc", "state_of_charge")
 
+# Sprint 7 (2026-07-02) — inverter fault/alarm enum sensors (Autopilot
+# DIAGNOSE opener, telemetry.schema.json v0.8.0).  ha-solarman exposes the
+# Deye fault/alarm registers as enum sensors named
+# `sensor.{prefix}_device_fault[_2]` / `sensor.{prefix}_device_alarm[_2]`
+# (device_class=enum, `options` list, raw register words in the `value`
+# attribute).  Detection requires BOTH device_class == "enum" AND one of
+# these hints in the entity_id or name — conservative on purpose so other
+# enum sensors (washer cycle states, HVAC presets, ...) never match.
+FAULT_NAME_HINTS: tuple[str, ...] = ("device_fault", "device_alarm")
+
 
 def _lower(s: Optional[str]) -> str:
     return (s or "").lower().strip()
@@ -158,6 +173,25 @@ def classify(entity: dict) -> dict:
         entity["surface"] = True
         entity["category"] = "battery.soc"
         return entity
+
+    # 2b. Inverter fault/alarm enum sensors → inverter.fault (v0.8.0).
+    #     Requires device_class=enum AND a device_fault/device_alarm hint in
+    #     the entity_id or name.  The name may come from the HA registry with
+    #     spaces ("Ground Master Device Fault") — normalise spaces to
+    #     underscores before matching.  Placed BEFORE the inverter.* power
+    #     hints and every catch-all: enum sensors carry no power signal, so
+    #     without this step they'd fall through to `other` and the cloud
+    #     DIAGNOSE rule would never see them.
+    if dc == "enum":
+        entity_id = _lower(entity.get("entity_id"))
+        name_normalised = name.replace(" ", "_")
+        if any(
+            hint in entity_id or hint in name_normalised
+            for hint in FAULT_NAME_HINTS
+        ):
+            entity["surface"] = True
+            entity["category"] = "inverter.fault"
+            return entity
 
     # 3. Inverter.* — require BOTH entity_id/name keyword AND power signal.
     if has_power:
